@@ -17,6 +17,7 @@ Decisions so far:
 - **Post-quantum algorithms for every signature and every E2E key encapsulation.** The TLS key exchange is hybrid X25519MLKEM768 (classical + PQ, defense in depth). It is not "pure" PQ, and the report says so.
 - A **separate ML-KEM certificate** per user, with a real, challenge-based proof of possession of the KEM key.
 - Authenticated encryption for private keys and client state at rest.
+- **Chat history lives on the client**, one sealed file per conversation. The server only holds envelopes until the recipient acks them. The sealed chats are the app's main "user data under authenticated encryption".
 - **Close the server man-in-the-middle (MITM) gap:** the messaging server must not be able to issue certificates.
 
 Already confirmed in the scratchpad probe (cryptography 50.0.2, ssl on OpenSSL 3.5.7):
@@ -41,7 +42,7 @@ Already done: `uv add cryptography`. Nothing will be committed (global rule).
 | User encryption | ML-KEM-768 (own certificate, KeyUsage keyEncipherment only) |
 | KEM proof of possession | CA encapsulates to `ek`; client answers with HMAC-SHA256 under a key derived from `ss` |
 | Message body | AES-256-GCM with a random 256-bit content key (CEK), plus key commitment `HMAC-SHA256(CEK, "ping/v1/commit")` |
-| CEK wrapping | ML-KEM-768 encapsulate → HKDF-SHA256 → AES-256-GCM (one wrap per reader) |
+| CEK wrapping | ML-KEM-768 encapsulate → HKDF-SHA256 → AES-256-GCM (recipient only; the sender keeps their own copy in local chat history) |
 | Signatures | ML-DSA-65, encrypt-then-sign |
 | Passwords | Client Scrypt → HKDF split; server stores salted HMAC-SHA256 of the 256-bit `auth_key` |
 | Private keys and client state at rest | Own AEAD container (AES-256-GCM, metadata as AAD), file mode 0600 |
@@ -157,7 +158,7 @@ sequenceDiagram
   CA-->>A: TLS[ Cert_A^sig, Cert_A^kem, Cert_Sub ]
   Note over A: Cert_A^sig ⊢ Root, Cert_A^kem ⊢ Root, certified keys == (pk_A, ek_A)
   Note over A: store AEnc_K_file(N, sk_A, AD=meta) and AEnc_K_file(N', dk_A, AD=meta')
-  Note over A: create sealed history.json and contacts.json (empty)
+  Note over A: create sealed chats/index.json and contacts.json (empty)
   A->>S: mTLS[Cert_A^sig][ register(alice, K_auth, Cert_A^sig, Cert_A^kem) ]
   Note over S: certs ⊢ Root, Cert_A^sig == TLS peer cert (byte-equal), CN == alice
   Note over S: no account "alice" yet
@@ -188,13 +189,13 @@ sequenceDiagram
 **What login proves, honestly.** mTLS proves possession of `sk_A`, and `sk_A` is sealed under the same password. So the server's password check is defense in depth, not a second, independent factor. Someone who steals the laptop can brute-force the password offline against the key file; Scrypt with n=2^17 only slows that down. The server check still helps if a decrypted key leaks from memory without the password, and the session token is bound to it.
 
 ### Flow 3: send (A → B) and receive
-Envelope: `E = (h, N, c, {(c_R, N_R, w_R)} for R ∈ {B, A}, σ)`, where
-- `h = (id, A, B, ts, H(Cert_A^sig), H(Cert_B^kem), H(Cert_A^kem), commit)`, with `id ←$ {0,1}^128` and `commit = MAC_CEK("ping/v1/commit")`
+Envelope: `E = (h, N, c, (c_B, N_B, w_B), σ)`, where
+- `h = (id, A, B, ts, H(Cert_A^sig), H(Cert_B^kem), commit)`, with `id ←$ {0,1}^128` and `commit = MAC_CEK("ping/v1/commit")`
 - `c = AEnc_CEK(N, m, AD = h)`, with `CEK ←$ {0,1}^256` and `N ←$ {0,1}^96`
-- `(ss_R, c_R) ← Encaps(ek_R)`, `KEK_R = KDF(ss_R, "ping/v1/wrap" ‖ R ‖ H(h))`, `w_R = AEnc_KEK_R(N_R, CEK, AD = R)`
-- `σ = Sig_sk_A(h ‖ N ‖ c ‖ wraps)`
+- `(ss_B, c_B) ← Encaps(ek_B)`, `KEK_B = KDF(ss_B, "ping/v1/wrap" ‖ B ‖ H(h))`, `w_B = AEnc_KEK_B(N_B, CEK, AD = B)`
+- `σ = Sig_sk_A(h ‖ N ‖ c ‖ wrap)`
 
-The sender's own wrap lets Alice re-read what she sent from any later inbox sync. Because `commit` is in the signed header, every reader checks that its unwrapped CEK is the one committed to. So a malicious sender can't wrap different CEKs for Bob and for herself and have one ciphertext decrypt to two different messages (AES-GCM alone is not key-committing).
+There is only one wrap, for the recipient. The server deletes an envelope once the recipient acks it, so a sender wrap would never be fetched back. Alice writes her own copy to her sealed chat with Bob at send time instead. `commit` is in the signed header, so a revealed CEK binds to exactly one plaintext (AES-GCM alone is not key-committing). That matters if Bob ever reports a message as abuse.
 
 ```mermaid
 sequenceDiagram
@@ -208,29 +209,67 @@ sequenceDiagram
   Note over A: no pin: pin now as "unverified"; pin differs: STOP (KeyChanged)
   Note over A: CEK ←$ {0,1}^256, N ←$ {0,1}^96, commit = MAC_CEK("ping/v1/commit")
   Note over A: c = AEnc_CEK(N, m, AD=h)
-  Note over A: for R in {B, A}: (ss_R, c_R) ← Encaps(ek_R)
-  Note over A: KEK_R = KDF(ss_R, "ping/v1/wrap" ‖ R ‖ H(h)), w_R = AEnc_KEK_R(N_R, CEK, AD=R)
-  Note over A: σ = Sig_sk_A(h ‖ N ‖ c ‖ wraps)
+  Note over A: (ss_B, c_B) ← Encaps(ek_B)
+  Note over A: KEK_B = KDF(ss_B, "ping/v1/wrap" ‖ B ‖ H(h)), w_B = AEnc_KEK_B(N_B, CEK, AD=B)
+  Note over A: σ = Sig_sk_A(h ‖ N ‖ c ‖ wrap)
   A->>S: mTLS[ send(token, E) ]
   Note over S: TLS peer CN == session user == h.sender, recipient exists, quota ok
   Note over S: seq ← next_seq(bob), store messages/bob/<seq>.json (opaque, holds no dk)
   S-->>A: ok(seq)
-  Note over A: history = AEnc_K_state(history ∪ {sent: id, bob, ts, m})
+  Note over A: chat[bob] = AEnc_K_state(chat[bob] ∪ {out: id, local_ts, m, sent(seq)}), update index
   B->>S: mTLS[Cert_B^sig][ wait_inbox(token, since_seq) ]
   Note over S: TLS peer CN == session user == bob
   S-->>B: [(seq, E), ...]
   Note over B: (1) Cert_A^sig ⊢ Root, CN = h.sender, pin (or pin now as unverified)
-  Note over B: (2) Vrfy_pk_A(h ‖ N ‖ c ‖ wraps, σ)
-  Note over B: (3) h.recipient == bob, H(Cert_B^kem) matches
+  Note over B: (2) Vrfy_pk_A(h ‖ N ‖ c ‖ wrap, σ)
+  Note over B: (3) h.recipient == bob, H(Cert_B^kem) matches (or an archived KEM cert in grace, stage 2)
   Note over B: any failure in (1) to (3): REJECT, never decrypt
-  Note over B: (4) id already in history: skip as duplicate (audit), go to (7)
+  Note over B: (4) id already in chat[alice]: skip as duplicate (audit), go to (7)
   Note over B: (5) ss_B ← Decaps(dk_B, c_B), KEK_B = KDF(ss_B, "ping/v1/wrap" ‖ B ‖ H(h))
   Note over B: (6) CEK = ADec_KEK_B(N_B, w_B, AD=B), MAC_CEK(...) == commit, m = ADec_CEK(N, c, AD=h)
-  Note over B: (6b) history = AEnc_K_state(history ∪ {received or rejected: id, alice, ts, m or reason})
+  Note over B: (6b) chat[alice] = AEnc_K_state(chat[alice] ∪ {in: id, local_ts, sender_ts, seq, m}), unread++
+  Note over B: rejected instead: append {id, claimed sender, reason} to the ⚠ rejected bucket, never chat[alice]
   B->>S: mTLS[ ack(token, [seq, ...]) ]
   Note over S: delete messages/bob/<seq>.json
 ```
-**Delivery is at-least-once with de-duplication.** The server keeps an envelope until the recipient acks it. Bob writes his sealed history before acking, so a crash in between causes a redelivery, which step (4) skips. Rejected envelopes are acked too, and recorded in history with their reason, so they show up once instead of being re-fetched forever. Read messages live in Bob's sealed `history.json`, not on the server. That's what keeps history readable after logging in again, and it's the main "user data stored under authenticated encryption" in the app.
+**Delivery is at-least-once with de-duplication.** The server keeps an envelope until the recipient acks it. Bob writes his sealed chat before acking, so a crash in between causes a redelivery, which step (4) skips. Rejected envelopes are acked too, and recorded in the `⚠ rejected` bucket with their reason, so they show up once instead of being re-fetched forever. Read messages live in Bob's sealed chat files, not on the server. That's what keeps a conversation readable after logging in again (see "Chat history").
+
+## Chat history
+Each client keeps its conversations locally, sealed under `state_key`.
+
+**Storage:**
+```text
+data/clients/<me>/chats/
+  index.json            # sealed, role state-chat-index
+  <fid>.json            # one per peer, sealed, role state-chat
+  .lock                 # fcntl.flock target
+```
+- `fid = hex(HMAC(state_key, canon({"ctx":"ping/v1/chat-file", "peer":peer}))[:16])`. Filenames don't reveal who the user talks to.
+- **`index.json`** maps `peer → {fid, unread, last_local_ts, last_preview, badge}`. The chat list is read from it. It also makes deletion detectable: a chat file that the index lists but that is missing means tampering, so the client refuses to start (`--reset-state` is the explicit escape hatch).
+- Every chat file's container carries `peer` in its AAD (see Keystore). Swapping Bob's file for Carol's, or a chat file for the index, breaks the tag.
+- **Record:** `{msg_id, dir: in|out|system, local_ts, sender_ts, server_seq, status: ok|sent|failed, verified_then, text}`.
+  - `local_ts` is the client clock: send time for outgoing messages, receipt time for incoming ones.
+  - `sender_ts` is the timestamp the sender claimed. It isn't trusted.
+- **Ordering:** by `local_ts`, then `server_seq`. If `sender_ts` differs from `local_ts` by more than 5 minutes, show `(sender clock: …)` next to the message.
+- **De-duplication** is per conversation: `msg_id` is looked up in the chat file for `header.sender`.
+- **Outgoing:** the message is appended with status `sending`, which becomes `sent(seq)` when the server says ok, or `failed` (the UI offers a retry, which re-seals with a fresh `msg_id`).
+- **Rejected envelopes** go to a separate sealed `⚠ rejected` bucket. It's a reserved peer name that the username regex can't produce. They **never** go into the chat of the sender they claim to be from, so a forger can't inject lines into Alice ↔ Bob.
+- **System lines** are written into the chat itself: key changed, key rotated (stage 2), contact verified.
+- **Concurrency:** writes are atomic (`os.replace`). A process-local lock covers the listener thread vs. the input thread, and an `fcntl.flock` on `chats/.lock` covers two processes running as the same user. The chat file is always written before the index. If a crash leaves the index behind, it's rebuilt from the chat files at startup (audit `chat.index_rebuilt`).
+
+**What the user sees (client UI):**
+- `chats` lists conversations by last activity. Each row has the peer, the unread count, a badge (`✔ verified` / `? unverified` / `⚠ key changed`), and the time and a 40-character preview of the last message. The `⚠ rejected` bucket comes last, and only when it isn't empty.
+- `open <peer>` shows a header line, then the last 20 messages:
+  ```text
+  ── bob  ✔ verified ─────────────────────────
+  [19:02] alice: hola bob                    ✔ sent
+  [19:03] bob:   hola!                       ✔
+  [19:05] ⚙ bob's keys changed – run /verify
+  ```
+  - Inside a conversation, a plain line sends a message. `/more` pages back 20, `/verify` runs the safety-number check, and `/back` returns to the list.
+  - Opening a chat clears its unread count.
+- **Live messages:** a message for the open chat is printed inline. Otherwise one notice line is printed (`[new message from carol · 2 unread]`) and the unread count goes up. All terminal output goes through one print lock that redraws the input prompt, so the listener thread never garbles what the user is typing.
+- Local mode looks the same; only the delivery source (1 s polling) differs.
 
 ## Sign-up flow
 1. The client generates ML-DSA-65 and ML-KEM-768 key pairs.
@@ -245,7 +284,7 @@ sequenceDiagram
    - the KEM public key has never been certified before (index `data/ca/kem_index/<H(ek)>`)
 4. **KEM proof of possession.** The CA encapsulates to the submitted `ek` and returns `(rid, kem_ct)`. The client decapsulates and sends `issue_finish(rid, t)`, with `t = HMAC(HKDF(ss, "ping/v1/kem-pop"), canon({rid, H(csr), H(ek)}))`. Pending challenges live in memory for 120 s and can be used once.
 5. **The CA builds both certificates itself.** It ignores any extensions requested in the CSR, sets the subject, the SAN `ping:user:<name>`, KeyUsage and EKU, then signs. It claims the name by creating `data/ca/issued/<user>.json` with `O_CREAT|O_EXCL`, so two concurrent requests for the same name (threads or local processes) can't both succeed. It returns the certificates plus the chain.
-6. **The client verifies the certificates:** chain to the pinned root, CN = username, and the public keys equal its own. It then seals and saves the keys, and creates empty sealed `history.json` and `contacts.json`.
+6. **The client verifies the certificates:** chain to the pinned root, CN = username, and the public keys equal its own. It then seals and saves the keys, and creates an empty sealed `chats/index.json` and `contacts.json`.
 7. **Client → server `register`** over mTLS, presenting the new signing certificate. It sends:
    - the username
    - `auth_key`
@@ -263,9 +302,9 @@ Who could attempt a MITM, and why it fails. This table applies to remote mode; l
 | Malicious messaging server | Get a real CA certificate for someone else's KEM key | KEM proof of possession: the CA certifies an `ek` only if the requester could decapsulate its challenge, and never certifies the same `ek` twice. |
 | Malicious messaging server | Serve an old revoked Bob certificate | Clients check the CA's CRL (stage 2), and the CA allows one active pair per name |
 | Malicious messaging server, or anyone | Register as "bob" before Bob does, by calling the unauthenticated CA `issue` itself | That's squatting, not a MITM: the squatter holds the only "bob" keys, and the real Bob's sign-up is refused, so it's visible. Prevented properly only by identity proofing, which is out of scope. |
-| Malicious messaging server | Replay, re-address or overwrite stored mail | The server assigns its own per-recipient sequence number, so a sender can't choose the storage filename. The signature covers the recipient and its key fingerprint. A duplicate `msg_id` is skipped against the sealed history. |
+| Malicious messaging server | Replay, re-address or overwrite stored mail | The server assigns its own per-recipient sequence number, so a sender can't choose the storage filename. The signature covers the recipient and its key fingerprint. A duplicate `msg_id` is skipped against the sealed chat for that sender. |
 | CA service key | Pose as the messaging server | Distinct DNS SANs; clients require `msg.ping.internal` on the messaging port. |
-| **Compromised CA service** | Issue a second valid "bob" pair | **Key pinning (trust on first use, TOFU):** the first time Alice sends to or receives from Bob, the client pins Bob's certificate fingerprints in `contacts.json` (sealed) and marks him **unverified**. Messages from an unverified contact display as `[bob ? unverified]`; sending to one is allowed with a warning. Any later change → hard stop: "bob's keys changed – verify". **Safety numbers:** `verify <contact>` shows `SHA-256(canon(sorted([my sign fp, my kem fp, their sign fp, their kem fp])))` as 12 groups of 5 digits. The two users compare them in person and mark the contact verified. A key change on a verified contact is never accepted silently. **Caveat for the report:** a substitution on the very first contact is caught only once the safety numbers are compared. |
+| **Compromised CA service** | Issue a second valid "bob" pair | **Key pinning (trust on first use, TOFU):** the first time Alice sends to or receives from Bob, the client pins Bob's certificate fingerprints in `contacts.json` (sealed) and marks him **unverified**. Messages from an unverified contact display as `[bob ? unverified]`; sending to one is allowed with a warning. Any later change → hard stop: "bob's keys changed – verify". **Safety numbers:** `verify <contact>` shows `SHA-256(canon(sorted([my sign fp, my kem fp, their sign fp, their kem fp])))` as 12 groups of 5 digits. The two users compare them in person and mark the contact verified. A key change on a verified contact is never accepted silently. The only exception is a stage 2 rotation endorsed by the pinned key (see "Key rotation"). **Caveat for the report:** a substitution on the very first contact is caught only once the safety numbers are compared. |
 | Root CA compromise | Anything | Same pinning and safety numbers. Out of scope beyond that. |
 
 What stays possible: the server can see metadata, and can drop or delay messages. It can't read, modify or forge them, and it can't MITM a verified contact.
@@ -274,15 +313,16 @@ What stays possible: the server can see metadata, and can drop or delay messages
 Every private key file (Root CA, Sub-CA, two TLS keys, user sign and KEM) and every sealed client-state file is a JSON container:
 ```json
 {"v":1, "alg":"AES-256-GCM", "kdf":{"name":"scrypt","n":131072,"r":8,"p":1,"salt":"<16B>"} | {"name":"login"},
- "owner":"alice", "role":"user-sign|user-kem|root-ca|sub-ca|ca-tls|server-tls|state-history|state-contacts",
+ "owner":"alice", "role":"user-sign|user-kem|user-kem-old|root-ca|sub-ca|ca-tls|server-tls|state-chat|state-chat-index|state-contacts",
+ "peer":"<chat peer, empty otherwise>",
  "pub_fp":"<sha256 of public key DER, empty for state>", "nonce":"<12B>", "ct":"<GCM(payload)‖tag>"}
 ```
 - **Wrapping key (KEK):**
   - CA and server keys: `Scrypt(passphrase, salt)`, with the parameters stored in the file.
   - User keys: `keyfile_key = HKDF(pw_key, info="ping/keyfile")`.
   - Client state: `state_key = HKDF(pw_key, info="ping/state")`.
-- **Encryption:** `ct = AESGCM(kek).encrypt(urandom(12), payload, aad=canon({v, alg, kdf, owner, role, pub_fp}))`.
-  - Swapping files, changing the owner or role, or editing the KDF parameters (a downgrade) all break the tag. That includes swapping `history.json` and `contacts.json`, because they have different roles.
+- **Encryption:** `ct = AESGCM(kek).encrypt(urandom(12), payload, aad=canon({v, alg, kdf, owner, role, peer, pub_fp}))`.
+  - Swapping files, changing the owner, role or peer, or editing the KDF parameters (a downgrade) all break the tag. That includes swapping one chat file for another (different `peer`) and swapping a chat file, the chat index or `contacts.json` for each other (different roles).
 - **Opening:**
   1. `InvalidTag` means a wrong passphrase or a tampered file. The two can't be told apart, by design.
   2. Check that the public key's SHA-256 equals `pub_fp`.
@@ -294,10 +334,10 @@ Every private key file (Root CA, Sub-CA, two TLS keys, user sign and KEM) and ev
   3. `load_cert_chain(cert, tmp, password=otp)` is called, and the file and directory are deleted in a `finally` block.
 
   The disk never holds the key unencrypted, and the temporary copy's password never touches disk.
-- **Sealed client state:** `history.json` holds sent and received messages, rejected envelopes with their reason, and so the set of seen `msg_id`s. `contacts.json` holds pins and verified flags. Both use `state_key`.
-  - **Detected:** any edit; swapping the two files; swapping in another user's files.
-  - **Detected:** deleting a state file while the user's key files still exist. Sign-up creates them together, so the client refuses to start and tells the user to run `ping client --reset-state` explicitly.
-  - **Not detected (stated limitation):** rolling back to an older, validly sealed copy. Both versions verify under the same `state_key`, and there is no trusted monotonic storage to compare against. Rolling back `contacts.json` could undo a pin. Rolling back `history.json`, combined with a malicious server that kept a copy of an acked envelope, could get an old message shown again.
+- **Sealed client state:** the chat files and `chats/index.json` (see "Chat history"), and `contacts.json` (pins and verified flags). All use `state_key`.
+  - **Detected:** any edit; swapping any two state files; swapping in another user's files.
+  - **Detected:** deleting `contacts.json` or `chats/index.json` while the user's key files still exist (sign-up creates them together), and deleting a chat file the index lists. The client refuses to start and tells the user to run `ping client --reset-state` explicitly.
+  - **Not detected (stated limitation):** rolling back a file to an older, validly sealed copy. Both versions verify under the same `state_key`, and there is no trusted monotonic storage to compare against. Rolling back `contacts.json` could undo a pin. Rolling back a chat file together with the index, combined with a malicious server that kept a copy of an acked envelope, could get an old message shown again.
 
 ## Secrets: validation and how they get loaded
 ### CA and server passphrases
@@ -346,11 +386,9 @@ Wire and disk format: JSON, binary fields base64url without padding.
 {
   "header":  {"v":1, "msg_id":"<16B rand>", "sender":"alice", "recipient":"bob",
               "ts":"2026-10-26T19:00:00Z", "sender_sign_cert_fp":"<sha256>",
-              "sender_kem_cert_fp":"<sha256>", "recipient_kem_cert_fp":"<sha256>",
-              "cek_commit":"<32B>"},
+              "recipient_kem_cert_fp":"<sha256>", "cek_commit":"<32B>"},
   "body":    {"nonce":"<12B>", "ct":"<AES-GCM ciphertext‖tag>"},
-  "wraps":   {"bob":   {"kem_ct":"<1088B>", "nonce":"<12B>", "wrapped_cek":"<48B>"},
-              "alice": {"kem_ct":"…", "nonce":"…", "wrapped_cek":"…"}},
+  "wrap":    {"kem_ct":"<1088B>", "nonce":"<12B>", "wrapped_cek":"<48B>"},
   "sig":     "<ML-DSA-65 signature, 3309B>"
 }
 ```
@@ -359,31 +397,31 @@ Wire and disk format: JSON, binary fields base64url without padding.
 **Strict parsing.** `parse_envelope` rejects:
 - duplicate JSON keys (via `object_pairs_hook`)
 - unknown or missing fields
-- a `wraps` object whose keys aren't exactly `{sender, recipient}`
+- a `wrap` that isn't exactly one object with `kem_ct`, `nonce` and `wrapped_cek`
 - non-canonical base64url: every binary field must re-encode to exactly the string received
 
 Without that last check, a flipped padding bit could change the stored file without changing the decoded bytes, and the tamper demo would show nothing.
 
 **Sealing (on Alice's client):**
-1. Refuse `recipient == sender`, so the two wraps never collide.
+1. Refuse `recipient == sender`.
 2. Resolve Bob's certificates. Check the chain to the pinned root, CN, purpose, validity and the pin. On first contact, pin him as unverified; if the pin has changed, stop with `KeyChanged`.
 3. `cek = urandom(32)`, `n = urandom(12)`, `header.cek_commit = HMAC(cek, "ping/v1/commit")`.
 4. `body.ct = AESGCM(cek).encrypt(n, plaintext, aad=canon(header))`. This gives confidentiality and integrity, and binds the header (the AAD) to the body.
-5. For each reader R in {recipient, sender}:
-   1. `(ss, kem_ct) = R_kem_pub.encapsulate()`.
-   2. `kek = HKDF-SHA256(ss, info=canon({"ctx":"ping/v1/wrap", "r":R, "h":sha256(canon(header))}))`.
-   3. `wrapped_cek = AESGCM(kek).encrypt(n_R, cek, aad=canon({"r":R}))`.
-6. `sig = alice_sign.sign(canon({header, body, wraps}))`, computed over the base64url strings exactly as they go on the wire. The signature covers everything, including both names and both KEM certificate fingerprints. That stops a forwarded or re-addressed copy from being accepted.
-7. After the server returns `ok`, append the message to Alice's sealed history as sent.
+5. Wrap for the recipient:
+   1. `(ss, kem_ct) = bob_kem_pub.encapsulate()`.
+   2. `kek = HKDF-SHA256(ss, info=canon({"ctx":"ping/v1/wrap", "r":"bob", "h":sha256(canon(header))}))`.
+   3. `wrapped_cek = AESGCM(kek).encrypt(n_R, cek, aad=canon({"r":"bob"}))`.
+6. `sig = alice_sign.sign(canon({header, body, wrap}))`, computed over the base64url strings exactly as they go on the wire. The signature covers everything, including both names and the recipient's KEM certificate fingerprint. That stops a forwarded or re-addressed copy from being accepted.
+7. Append the plaintext to Alice's sealed chat with Bob as `sending`. When the server returns `ok(seq)`, mark it `sent(seq)`; on an error, mark it `failed`.
 
-**Opening (on the reader's client: Bob, or Alice re-reading her own copy).** Fail-closed, in this order:
+**Opening (on Bob's client).** Fail-closed, in this order:
 1. **Chain and pin:** resolve the certificate by `sender_sign_cert_fp`. Verify the chain to the root, validity, EKU, CN = `header.sender`, and the pin (first contact: pin as unverified).
-2. **Signature:** verify `sig` over `canon({header, body, wraps})`.
-3. **Addressing:** I am `recipient` (or `sender`, for my own copy), and the matching `*_kem_cert_fp` is my KEM certificate.
-4. **Duplicate:** `msg_id` already in sealed history → skip silently (audit `duplicate`), but still ack.
+2. **Signature:** verify `sig` over `canon({header, body, wrap})`.
+3. **Addressing:** `recipient == me`, and `recipient_kem_cert_fp` is my current KEM certificate (or, in stage 2, an archived one still in its grace period).
+4. **Duplicate:** `msg_id` already in my sealed chat with `header.sender` → skip silently (audit `duplicate`), but still ack.
 5. **Unwrap:** decapsulate → HKDF → unwrap the CEK, then check `HMAC(cek, "ping/v1/commit") == cek_commit`. This makes AES-GCM key-committing.
 6. **Decrypt:** decrypt the body with `aad=canon(header)`.
-7. **Record, then ack:** write the message (or the rejection reason) to sealed history, then `ack` its sequence number so the server deletes it.
+7. **Record, then ack:** append the message to the sealed chat with the sender (or the rejection to the `⚠ rejected` bucket), update the index, then `ack` its sequence number so the server deletes it.
 
 When the messaging server accepts an upload, it also checks that the mTLS CN, the session username and `header.sender` all match, and that the recipient exists. That's defense in depth; clients don't rely on it. The server never uses `msg_id` or `ts` for storage or ordering; it assigns its own per-recipient sequence number.
 
@@ -410,7 +448,9 @@ data/                              # app state, no private keys
   server/messages/<recipient>/.seq         # counter, updated under flock
   server/audit.log                 # stage 2: hash-chained audit entries
   clients/trust.json               # pinned Root fingerprint
-  clients/<u>/  profile.json  history.json  contacts.json   # last two sealed
+  clients/<u>/  profile.json  contacts.json                 # contacts sealed
+  clients/<u>/chats/  index.json  <fid>.json  .lock          # sealed chat history
+  clients/<u>/old/    kem.<fp>.key.json                      # stage 2: archived dk, 7-day grace
 run/                               # mode 0700, short-lived ssl key temp dirs
 logs/                              # JSON-lines app + audit logs (redacted)
   ca.log  server.log  client-<u>.log
@@ -434,11 +474,11 @@ logs/                              # JSON-lines app + audit logs (redacted)
 - **`src/ping/` PKI and messaging:**
   - `pki.py`: Root, Sub-CA and TLS certificate creation, user certificate issuance, CSR, KEM binding and KEM proof-of-possession helpers, `verify_cert(cert, purpose, at)`, fingerprints.
   - `contacts.py`: TOFU pins, safety numbers, the verified flag.
-  - `history.py`: sealed message history and the seen-id lookup.
+  - `chats.py`: `ChatStore` — `append`, `update_status`, `page(peer, before, n)`, `mark_read`, `list_chats`, `has_msg`, `rebuild_index`; per-peer sealed files and the sealed index.
   - `messaging.py`: `canon`, strict `parse_envelope`, `seal`, `open_envelope`, `MessageRejected(reason)`.
 - **`src/ping/` services and transport:**
-  - `ca_service.py`: `issue_begin`, `issue_finish`, `get_certs`, the issuance store, `sign_server_csr`, and (stage 2) revoke and CRL.
-  - `service.py`: messaging — register, login, logout, get_certs, send, `wait_inbox(token, since_seq, timeout≤25 s)` (long-poll; `timeout=0` is a plain inbox fetch), `ack(token, seqs)`, and `status` (stage 2). It keeps a per-recipient lock and sequence counter, and at most 500 pending envelopes per recipient (`inbox_full`).
+  - `ca_service.py`: `issue_begin`, `issue_finish`, `get_certs`, the issuance store, `sign_server_csr`, and (stage 2) revoke, CRL, `rotate_begin` and `rotate_finish`.
+  - `service.py`: messaging — register, login, logout, get_certs, send, `wait_inbox(token, since_seq, timeout≤25 s)` (long-poll; `timeout=0` is a plain inbox fetch), `ack(token, seqs)`, and (stage 2) `status` and `update_certs`. `get_certs(peer)` returns the current pair plus, in stage 2, the chain of rotation statements. It keeps a per-recipient lock and sequence counter, and at most 500 pending envelopes per recipient (`inbox_full`).
   - `protocol.py`: 4-byte length prefix + JSON, 1 MiB cap.
   - `tlsserver.py`: generic TLS server with handler dispatch, used by both services.
   - `backend.py`: `LocalBackend` and `RemoteBackend`, each exposing `ca` and `msg` sides. `RemoteBackend` passes the expected `server_hostname` for each service.
@@ -446,15 +486,16 @@ logs/                              # JSON-lines app + audit logs (redacted)
     - Subcommands: `init-pki`, `ca serve`, `ca sign-server --csr <path> --out <path>`, `server init`, `server serve`, `client`, and (stage 2) `ca revoke` and `status`.
     - Global flags: `--home` (repo-relative, see layout), `--trace`, `--host`, `--port`. Client-only flags: `--mode local|remote`, `--user`.
     - `client` with an empty home imports the Root certificate from `--root-cert <path>` and asks you to confirm its fingerprint. `server init` takes `--root-cert` the same way.
-    - Client menu: register (resumes a half-finished registration), login, send, history, contacts/verify, show my fingerprints, logout. Live delivery runs in the background once you're logged in.
+    - Client menu: register (resumes a half-finished registration), login, `chats`, `open <peer>` (conversation view: type to send, `/more`, `/verify`, `/back`), contacts/verify, show my fingerprints, `rotate` (stage 2), logout. Live delivery runs in the background once you're logged in.
+    - `ui.py`: the print lock with prompt redraw, the chat-list and conversation renderers.
 
 ## Logging and observability
 | Piece | Behavior |
 |---|---|
 | **Crypto trace** (`--trace`) | Human-readable, one line per crypto step, on stderr. Each line has the message number and the algorithm plus sizes, for example `[A→B #3] ML-KEM-768.Encaps(ek_bob) → ss 32 B, c 1088 B`, `AES-256-GCM.Enc 112 B → 128 B (+16 B tag)`, `ML-DSA-65.Sign → σ 3309 B`. On receive, each pipeline step prints `✔` or `✘ <reason>` (chain, pin, signature, addressing, unwrap, commit, decrypt). The CA traces issuance, including the KEM proof of possession. The server traces mTLS peer checks and envelope storage (sizes only). Used for the defense and for report screenshots. |
 | **App logs** | Python `logging`, one JSON object per line, written to `<home>/logs/<role>.log`. Fields: `ts, level, role, event, req_id, user, msg_id, ...`. `req_id` is created by the client and sent in every request frame. Context variables carry `req_id` and `msg_id` through the code, so one message can be traced across the client, server and CA logs. |
-| **Audit events** (WARN+, `event` prefixed `audit.`) | login ok/fail; mTLS rejected (no certificate, untrusted CA, CN mismatch); certificate issued or refused (including a failed KEM proof of possession and a reused KEM key); session/CN/sender mismatch; message rejected with its reason; duplicate message skipped; TOFU key change; (stage 2) revoked, password changed. |
-| **Redaction** | `RedactingFilter` on every handler drops or masks fields named `password, pw, pw_key, k_auth, key, sk, dk, cek, kek, ss, token, plaintext, m`. Session tokens are logged only as `H(token)[:8]`. Code logs sizes, fingerprints and IDs, never values. A test fails the build if any secret shows up in the logs (see Testing). |
+| **Audit events** (WARN+, `event` prefixed `audit.`) | login ok/fail; mTLS rejected (no certificate, untrusted CA, CN mismatch); certificate issued or refused (including a failed KEM proof of possession and a reused KEM key); session/CN/sender mismatch; message rejected with its reason; duplicate message skipped; TOFU key change; `chat.file_missing`, `chat.index_rebuilt`; (stage 2) revoked, password changed, `key.rotated`, `key.rotation_refused`. |
+| **Redaction** | `RedactingFilter` on every handler drops or masks fields named `password, pw, pw_key, k_auth, key, sk, dk, cek, kek, ss, token, plaintext, m, text, preview`. Session tokens are logged only as `H(token)[:8]`. Code logs sizes, fingerprints and IDs, never values. A test fails the build if any secret shows up in the logs (see Testing). |
 | **`ping status`** (stage 2) | Shows uptime, users, pending messages, active sessions, rejection counts by reason, and fingerprints plus expiry dates for the Root, Sub-CA and TLS certificates. Counters are in-memory per process. The server answers over mTLS, the CA over its TLS port. It returns only aggregate counts and public fingerprints, never usernames or per-user data, so any authenticated user may call it. In local mode it reads the shared `data/` directly and shows on-disk counts only. |
 | **Tamper-evident audit log** (stage 2, optional) | Each server audit entry stores `prev = H(previous entry)`, and every N entries (and on shutdown) the head is signed with the server's ML-DSA TLS key over `canon({"ctx":"ping/v1/audit-head", head, count})`. The context prefix keeps these signatures from ever being mistaken for TLS handshake signatures. `ping status --verify-audit` re-walks the chain. Stated limit: an attacker holding the server key can rewrite the whole log, and truncation after the last signed head isn't detected. |
 
@@ -462,10 +503,8 @@ logs/                              # JSON-lines app + audit logs (redacted)
 ### Live delivery (`wait_inbox`)
 - After login the client starts a background thread on its own mTLS connection. It loops on `wait_inbox(token, since_seq=last_acked_seq)`.
 - The server keeps a `threading.Condition` per recipient. `send` stores the envelope, then calls `notify_all` for that recipient. `wait_inbox` returns new envelopes straight away, or `[]` after 25 s, and the client then re-polls.
-- Each returned envelope goes through the full open pipeline before it's shown:
-  - `[alice ✔ verified] hola bob`, `[alice ? unverified] hola bob`, or
-  - `[REJECTED from alice: signature invalid]`.
-- Then the client writes history and acks.
+- Each returned envelope goes through the full open pipeline before it's shown. Then it's written to the sealed chat (or the `⚠ rejected` bucket) and acked.
+- Display (see "Chat history"): printed inline if that conversation is open, for example `[19:03] alice: hola bob  ✔`; otherwise a notice line `[new message from alice · 1 unread]`. A rejection shows as `[⚠ rejected envelope claiming to be from alice: signature invalid]`.
 - Local mode (no servers): the client polls `data/server/messages/<me>/` every 1 s for sequence numbers above its last ack, and acks by deleting the file under the recipient's lock. This is safe across processes because every write uses `os.replace`, and the sequence counter is only updated under `flock`.
 
 ### Per-role homes (models separate machines, all inside `<repo>/demo/`)
@@ -498,31 +537,33 @@ Start T1 and T2 before the clients. VS Code's split terminal works fine for this
 
 ### Demo script (what to show)
 1. Alice and Bob register. T1 traces the CSR check, the KEM challenge (`Encaps` → `t` verified) and issuance.
-2. Alice sends "hola bob". T4 shows `[alice ? unverified] hola bob`. Both run `verify`; the safety numbers match on screen, and the contact is marked verified.
-3. Alice sends a second message:
+2. Alice sends "hola bob". T4 prints `[new message from alice · 1 unread]`; `chats` shows alice with `? unverified`. Both run `verify`; the safety numbers match on screen, and the contact is marked verified.
+3. Bob runs `open alice` and replies; Alice sends a second message:
    - T3 traces Encaps, encryption and signing.
    - T2 logs `stored envelope 4.6 kB for bob seq=2` (no plaintext).
-   - T4 shows the message within about 1 s, with each check marked ✔. Then T2 logs the ack and the deletion.
-   - Bob logs out and back in: his history still shows both messages, with nothing re-fetched.
+   - T4 shows the message inline within about 1 s, with each check marked ✔. Then T2 logs the ack and the deletion.
+   - Bob logs out and back in. `chats` and `open alice` show the same conversation, both directions in order, with nothing re-fetched from the server.
+   - Show `ls demo/bob/data/clients/bob/chats/`: opaque file names, and every file is an AES-GCM container.
 4. Tamper:
    1. Bob logs out, and Alice sends a message.
    2. Run `scripts/tamper_demo.py --flip demo/server/data/server/messages/bob/<seq>.json`. It decodes `body.ct`, flips one byte and re-encodes, so the JSON stays valid.
-   3. Bob logs in. T4 shows `✘ signature invalid → REJECTED`, and the audit log shows the event.
+   3. Bob logs in. T4 shows `✘ signature invalid → REJECTED`, the entry appears in the `⚠ rejected` bucket (not in the chat with Alice), and the audit log shows the event.
 5. MITM: stop T2 and run `uv run python scripts/evil_server.py --home demo/server` in its place. It swaps in a rogue-CA certificate when Alice looks up a new contact, carol. Alice's send is refused with `✘ chain: untrusted issuer`.
-6. (Stage 2) `ping status` shows the rejection counters. `ping ca revoke bob` makes Bob's open connection drop and his next mTLS handshake fail.
+6. (Stage 2) Bob runs `rotate`. T1 traces the rotation statement check and the new KEM challenge. Alice's chat with Bob shows `⚙ bob rotated keys (signed by previous key) ✔`, and he stays `✔ verified`.
+7. (Stage 2) `ping status` shows the rejection counters. `ping ca revoke bob --reason keyCompromise` makes Bob's open connection drop and his next mTLS handshake fail. After Bob signs up again, Alice sees `⚠ bob's keys changed – verify`.
 
 ## Stage 1: core app (this pass)
 0. Run the "still to probe" items first, and adjust `pki.verify_cert` to whichever path works.
 1. Config (`--home`, `check_openssl`), logging (trace, JSON logs, audit, redaction), storage (atomic, exclusive create, flock), auth, keystore, pki (including KEM proof of possession), plus `init-pki`, `server init` and `ca sign-server`, with the unit tests for these.
 2. CA service, messaging service, LocalBackend, CLI register/login. **Checkpoint: local mode works end to end, including two client processes at once.**
-3. Messaging, contacts (TOFU pins and safety numbers), sealed history, send/inbox/ack, local-mode live delivery (polling), with envelope, tamper and MITM tests.
+3. Messaging, contacts (TOFU pins and safety numbers), `ChatStore` and the chat UI (`chats`, `open`, print lock), send/inbox/ack, local-mode live delivery (polling), with envelope, chat, tamper and MITM tests.
 4. Protocol, `tlsserver`, both TLS services, RemoteBackend, `wait_inbox` long-poll and the client listener thread, with integration and TLS tests.
 5. `scripts/demo.sh`, `scripts/evil_server.py`, plus a full four-terminal rehearsal.
 
 ## Stage 2: extras (after the stage-1 checkpoint)
 1. **Password change.** Runs over an authenticated session.
    1. Derive the old keys and open the key files (proves the old password).
-   2. Generate a new `client_salt`, derive the new keys, and re-seal the keys, `history.json` and `contacts.json` into `*.json.new` with fresh nonces. Write `profile.json.new` with the new salt. Write a `pwchange.pending` marker last.
+   2. Generate a new `client_salt`, derive the new keys, and re-seal the keys (including any archived old KEM key), every chat file, `chats/index.json` and `contacts.json` into `*.json.new` with fresh nonces. Chat file names change too, because `fid` is keyed with `state_key`. Write `profile.json.new` with the new salt. Write a `pwchange.pending` marker last.
    3. Call `change_password(old_auth, new_auth)`. The server verifies and atomically replaces the record.
    4. On success, `os.replace` the `.new` files into place (profile last), then delete the marker. On a clear refusal from the server, delete the `.new` files and the marker.
    5. **Recovery at startup**, if the marker exists (a crash, or a lost reply): ask for the password.
@@ -533,6 +574,7 @@ Start T1 and T2 before the clients. VS Code's split terminal works fine for this
    Certificates are unchanged.
 2. **Revocation and CRL.**
    - `init-pki` publishes an empty CRL straight away, so `VERIFY_CRL_CHECK_LEAF` never fails just because no CRL is loaded.
+   - CRL entries carry a reason code: `keyCompromise` (admin revocation) or `superseded` (key rotation, item 3). Clients treat them differently: see item 3.
    - Run by the CA service: `ping ca revoke <user> --reason keyCompromise` adds both serials to a CRL signed with ML-DSA-65, written to `keys/pki/sub/sub_ca.crl.pem`. The user's slot becomes free for re-issue. The KEM key stays in `kem_index`, so the old key can never be certified again.
    - The running CA re-signs the CRL every 24 h with `next_update` = 7 days, so a short CA outage doesn't lock everyone out.
    - `get_crl` endpoint on the CA.
@@ -540,16 +582,35 @@ Start T1 and T2 before the clients. VS Code's split terminal works fine for this
    - **Client `verify_cert`:** checks the CRL signature against the Sub-CA, freshness, and whether the serial is listed.
    - Messages from revoked senders are rejected, because the sender sets the timestamp and it can't be trusted.
    - A re-issued contact shows as a pin change, so the user verifies the safety number again.
-3. **Tamper and MITM demo**, `scripts/tamper_demo.py`. Uses a temporary `PING_HOME` and passphrase files, registers alice and bob, and sends a real message. It then runs every attack in the test catalogue below and prints `ATTACK → REJECTED: <reason>` for the report screenshots. It shares its scenario helpers with the tests. `--flip <file>` is the single-file mode used in the live demo.
-4. **`ping status`** with in-memory counters, and certificate fingerprints and expiry dates.
-5. **Tamper-evident audit log** (optional): hash-chained entries plus signed heads, and `status --verify-audit`.
+3. **Key rotation ("refresh").** A user replaces their keys routinely, and contacts can tell a **routine rotation** (endorsed by the old key, so no warning) from a **compromise or re-issue** (unendorsed, so the hard `KeyChanged` stop).
+   - **Certificate lifetime:** user certificates are valid for 90 days. When fewer than 14 days are left, the client says so at login and offers `rotate`. `rotate` is also in the menu at any time.
+   - **Rotation statement:** `rot = Sig_sk_old(canon({"ctx":"ping/v1/rotate", user, old_sign_fp, old_kem_fp, new_sign_fp, new_kem_fp, ts}))`. It's signed with the **old** signing key, and it's the link that lets contacts carry trust from the old keys to the new ones.
+   - **Flow:**
+     1. The client generates new ML-DSA and ML-KEM pairs.
+     2. Client → CA `rotate_begin(user, new_csr, new_ek, bind, rot)` over TLS, then the same KEM proof-of-possession round as sign-up (`rotate_finish`). The CA checks:
+        - `rot` verifies under the user's **currently active** signing certificate
+        - the fingerprints in `rot` match the new request and the active pair
+        - the new `ek` has never been certified (`kem_index`)
+     3. The CA issues the new pair, revokes the old serials with reason `superseded`, and updates `issued/<user>.json`. The name slot stays held throughout, so there is no first-come window for a squatter. The CA stores `rot`.
+     4. Client → server `update_certs(token, new_sig, new_kem, rot)`, inside the current session (old mTLS certificate plus the password-derived token). The server checks the chain, the CN, and `rot` under the stored old certificate. Then it replaces the account's certificates and appends to the account's rotation chain.
+     5. The client seals the new keys. It keeps the old `dk` archived (`clients/<u>/old/`, role `user-kem-old`) for a 7-day grace period, so envelopes already in flight to the old `ek` still open. After that the archived key is deleted.
+   - **Contacts (`contacts.py`).** When fetched certificates differ from the pin:
+     - If a chain of valid `rot` statements leads from the **pinned** fingerprints to the new ones, every new certificate verifies against the Root, and none of the replaced serials is on the CRL as `keyCompromise`: accept, re-pin, and **keep the verified flag**. The chat gets `⚙ bob rotated keys (signed by previous key) ✔`.
+     - Otherwise (re-issue after revocation, a compromised CA, any unendorsed change): hard stop with `KeyChanged`, the badge `⚠ key changed`, and the chat line `⚠ bob's keys changed – verify`.
+   - **Old-key signatures:** an envelope signed by a `superseded` certificate is accepted within 7 days of its CRL revocation date, measured on the reader's clock (the sender's `ts` isn't trusted), and shown with `(previous key)`. A `keyCompromise` certificate is never accepted.
+   - **Compromise stays a separate path:** `ping ca revoke <user> --reason keyCompromise` (admin), then a fresh sign-up. Contacts get the unendorsed `KeyChanged` and must re-verify.
+4. **Tamper and MITM demo**, `scripts/tamper_demo.py`. Uses a temporary `PING_HOME` and passphrase files, registers alice and bob, and sends a real message. It then runs every attack in the test catalogue below and prints `ATTACK → REJECTED: <reason>` for the report screenshots. It shares its scenario helpers with the tests. `--flip <file>` is the single-file mode used in the live demo.
+5. **`ping status`** with in-memory counters, and certificate fingerprints and expiry dates.
+6. **Tamper-evident audit log** (optional): hash-chained entries plus signed heads, and `status --verify-audit`.
 
 ## Known limitations (for the report)
 - **Login is one factor in practice:** the key file and the server check both come down to the same password (see Flow 2).
 - **No identity proofing:** the CA is first come, first served, and anyone (including the messaging server) can squat a name.
 - **Username enumeration** is possible through the CA and `get_certs`.
 - **First contact** relies on the CA until the safety numbers are compared.
-- **State rollback** of `history.json` or `contacts.json` to an older sealed copy is not detected.
+- **State rollback** of a chat file (with the index) or of `contacts.json` to an older sealed copy is not detected.
+- **History is per home/device:** there's no sync or backup. Losing the client home loses the conversations (the server deleted the envelopes on ack).
+- **Stolen key + password can rotate (stage 2):** whoever has the old key file and the password can rotate to their own keys, and contacts follow without a warning. That's no worse than the theft itself. The mitigation is an admin `keyCompromise` revocation, which breaks the rotation chain.
 - **No forward secrecy.** Readers use a static ML-KEM key, so an attacker who recorded envelopes and later steals `dk_B` (key file plus password) can read them. A ratchet is out of scope.
 - **Metadata** (who, whom, when, size) is visible to the server, which can also drop or delay messages.
 - **No revocation in stage 1:** a stolen key can't be revoked until stage 2.
@@ -578,12 +639,21 @@ Start T1 and T2 before the clients. VS Code's split terminal works fine for this
 - `test_keystore.py`:
   - Round trip for ML-DSA and ML-KEM keys.
   - A wrong passphrase raises `InvalidTag`.
-  - Mutating any one of ct, nonce, owner, role, pub_fp or kdf fails; swapping the sign and KEM files fails; swapping `history.json` and `contacts.json` fails.
+  - Mutating any one of ct, nonce, owner, role, peer, pub_fp or kdf fails; swapping the sign and KEM files fails; swapping two chat files, or a chat file with the index or `contacts.json`, fails.
   - Fresh nonce on every re-seal; mode 0600.
   - `assert_pair` rejects a mismatched key.
   - `ssl_load_key` leaves `<home>/run` empty.
   - The passphrase file is refused if its mode isn't 0600.
-  - A tampered `history.json` or `contacts.json` is rejected; a deleted one, with the key files still present, is refused at startup.
+  - A tampered chat file, index or `contacts.json` is rejected; a deleted index, contacts file or listed chat file, with the key files still present, is refused at startup.
+- `test_chats.py`:
+  - Append and page back in order, including the `local_ts` / `server_seq` tie-break; `/more` paging boundaries.
+  - Unread counts go up on receive and reset on `mark_read`.
+  - A duplicate `msg_id` within a chat is skipped; the same `msg_id` from a different sender isn't.
+  - Outgoing status goes from `sending` to `sent(seq)` or `failed`.
+  - The file name doesn't contain the peer name.
+  - A missing index is rebuilt from the chat files (audit `chat.index_rebuilt`).
+  - Two processes appending to the same user's chats concurrently lose nothing.
+  - The `sender clock` note appears only beyond a 5-minute skew.
 - `test_pki.py`:
   - The chain verifies, for both the signing and the KEM certificate.
   - Rejected:
@@ -603,14 +673,15 @@ Start T1 and T2 before the clients. VS Code's split terminal works fine for this
   - Two concurrent `issue_finish` calls for the same name (threads, and two processes over one home): exactly one succeeds.
 - `test_contacts.py`: first use pins the contact as unverified; the same keys are accepted; changed keys raise `KeyChanged`; the safety number is the same from both sides and changes when any key changes; a verified flag survives a reload.
 - `test_messaging.py`:
-  - Round trip works; the sender can open their own copy, and the sent message is in their sealed history.
+  - Round trip works; the sent copy is in the sender's chat with status `sent(seq)`.
   - Each case raises `MessageRejected` with the expected reason:
     - a mutation of header, ct, nonce, kem_ct, wrapped_cek, cek_commit or sig
-    - non-canonical base64url, a duplicate JSON key, an unknown field, an extra or missing wrap
+    - non-canonical base64url, a duplicate JSON key, an unknown field, a malformed `wrap`
     - re-addressed to another recipient
     - a wrong recipient key
     - signed by a valid certificate that isn't the sender's
-    - a malicious sender wrapping a different CEK for each reader (commit mismatch for one of them)
+    - a CEK that doesn't match `cek_commit`
+  - A forged "from alice" envelope lands in the `⚠ rejected` bucket, never in the chat with Alice.
   - A replayed `msg_id` is skipped as a duplicate, not shown twice.
   - Sending to yourself is refused.
   - `canon` is stable regardless of key order.
@@ -635,7 +706,9 @@ Start T1 and T2 before the clients. VS Code's split terminal works fine for this
   - Registration interrupted after issuance can be resumed.
   - Local mode: a client that only logs in never asks for the Sub-CA passphrase.
 - `test_e2e.py`:
-  - alice sends to bob and bob reads it; after a logout and login, bob's history still shows it and nothing is re-delivered as REJECTED; mallory can't read bob's inbox; the safety numbers match across clients.
+  - alice sends to bob and bob reads it; after both log out and back in, `open` shows the same conversation on both sides, both directions in order, and nothing is re-delivered as REJECTED; mallory can't read bob's inbox; the safety numbers match across clients.
+  - A live message for a conversation that isn't open increments its unread count; one for the open conversation doesn't.
+  - A send while the server is down is recorded as `failed`, and a retry sends it.
   - The server assigns sequence numbers: two envelopes with the same `msg_id` don't overwrite each other, and a backdated `ts` is still delivered.
   - `ack` deletes. An unacked envelope is redelivered, and is skipped as a duplicate after a client crash between the history write and the ack.
   - Live delivery: bob's `wait_inbox` returns within 1 s of alice's send, and returns `[]` on timeout. Polling in local mode picks the message up.
@@ -668,6 +741,16 @@ Start T1 and T2 before the clients. VS Code's split terminal works fine for this
   - a server refusal leaves the old files intact
   - a crash after the server accepted but before the local swap is recovered on the next start
   - other sessions are killed
+  - every chat file is renamed and re-sealed, and the conversations read the same afterwards
+- Key rotation:
+  - an endorsed rotation keeps the verified flag and writes the `⚙ rotated` line
+  - a `rot` signed by the wrong key is refused by the CA and by the server
+  - a multi-step rotation chain is followed
+  - a chain containing a `keyCompromise` serial gives `KeyChanged`
+  - an in-flight envelope to the old `ek` opens during the grace period and is rejected after it; the archived key is deleted after the grace period
+  - an old-key signature is accepted within 7 days of `superseded`, rejected after, and never accepted for `keyCompromise`
+  - a reused `ek` on rotation is refused
+  - the name slot stays held during a rotation (no squatting window)
 - CRL:
   - the initial empty CRL lets everyone connect
   - a revoked user fails mTLS and client-side checks, and their open connection is closed
@@ -680,7 +763,7 @@ Start T1 and T2 before the clients. VS Code's split terminal works fine for this
 ## Verification (manual, for the report)
 - `uv run ping init-pki` → `openssl x509 -text -noout -in ...` shows ML-DSA OIDs, BasicConstraints, KeyUsage, EKU and SANs for every certificate.
 - Full demo rehearsal, done both ways: Option A (four ordinary terminals) and Option B (`scripts/demo.sh --reset`). Check that:
-  - Bob sees Alice's message live, and still sees it in his history after logging in again.
+  - Bob sees Alice's message live, and `open alice` still shows the whole conversation after logging in again.
   - The tamper and `evil_server.py` steps are rejected.
   - `demo/*/logs/*.log` contain audit events but no secrets.
   - Nothing is created outside `<repo>`: `git status --ignored` shows only `demo/`, `~` is untouched, and the system temp directory gets no `ping` files.
