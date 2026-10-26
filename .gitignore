@@ -7,6 +7,8 @@ __pycache__/
 # Generated at runtime: never commit key material or app state
 keys/
 data/
+logs/
+demo/
 
 # OS / editor
 .DS_Store
