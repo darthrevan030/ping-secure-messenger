@@ -1,0 +1,12 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated at runtime: never commit key material or app state
+keys/
+data/
+
+# OS / editor
+.DS_Store
