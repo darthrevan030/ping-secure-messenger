@@ -12,11 +12,11 @@ Points: PKI 1.0, report 1.0, AE 0.6, signatures 0.6, key management 0.5, auth 0.
 
 Decisions so far:
 - A client–server messenger over **TLS 1.3 with mutual TLS (mTLS)**.
-- A transport abstraction so the app can fall back to local, in-process mode.
+- A transport abstraction so the app can fall back to local, in-process mode. Local mode is a **single-operator** mode: one person controls every role on one machine. It runs the same client crypto and the same envelope checks, but it does not demonstrate the separation between the CA and the messaging server (see "Backends").
 - The `cryptography` library for all crypto.
-- **Pure post-quantum algorithms.**
-- A **separate ML-KEM certificate** per user.
-- Authenticated encryption for private keys at rest.
+- **Post-quantum algorithms for every signature and every E2E key encapsulation.** The TLS key exchange is hybrid X25519MLKEM768 (classical + PQ, defense in depth). It is not "pure" PQ, and the report says so.
+- A **separate ML-KEM certificate** per user, with a real, challenge-based proof of possession of the KEM key.
+- Authenticated encryption for private keys and client state at rest.
 - **Close the server man-in-the-middle (MITM) gap:** the messaging server must not be able to issue certificates.
 
 Already confirmed in the scratchpad probe (cryptography 50.0.2, ssl on OpenSSL 3.5.7):
@@ -24,6 +24,12 @@ Already confirmed in the scratchpad probe (cryptography 50.0.2, ssl on OpenSSL 3
 - `x509.verification` ClientVerifier accepts a URI SAN.
 - ML-KEM public keys can go in certificates.
 - An mTLS handshake with ML-DSA certificates on both sides succeeds.
+
+Still to probe before relying on it:
+- Verifying an ML-KEM leaf (keyEncipherment, no clientAuth EKU) with `x509.verification` and a custom `ExtensionPolicy`. Fallback: `cert.verify_directly_issued_by(issuer)` for each link, plus manual validity, BasicConstraints, KeyUsage and EKU checks in `pki.verify_cert`.
+- `ssl.load_cert_chain` with an encrypted PKCS#8 ML-DSA key.
+- ML-DSA-signed CRLs in both `cryptography` and the `ssl` module's OpenSSL (stage 2).
+- Whether Python 3.14's `ssl` can report or configure the key-exchange group. If not, rely on the OpenSSL ≥ 3.5 assertion below plus the `openssl s_client` check.
 
 Already done: `uv add cryptography`. Nothing will be committed (global rule).
 
@@ -33,41 +39,46 @@ Already done: `uv add cryptography`. Nothing will be committed (global rule).
 | Root CA | ML-DSA-87 |
 | Sub-CA, CA-service TLS, messaging-server TLS, user signing/mTLS | ML-DSA-65 |
 | User encryption | ML-KEM-768 (own certificate, KeyUsage keyEncipherment only) |
-| Message body | AES-256-GCM with a random 256-bit content key (CEK) |
-| CEK wrapping | ML-KEM-768 encapsulate → HKDF-SHA256 → AES-256-GCM |
+| KEM proof of possession | CA encapsulates to `ek`; client answers with HMAC-SHA256 under a key derived from `ss` |
+| Message body | AES-256-GCM with a random 256-bit content key (CEK), plus key commitment `HMAC-SHA256(CEK, "ping/v1/commit")` |
+| CEK wrapping | ML-KEM-768 encapsulate → HKDF-SHA256 → AES-256-GCM (one wrap per reader) |
 | Signatures | ML-DSA-65, encrypt-then-sign |
-| Passwords | Client Scrypt → HKDF split; server Scrypt again |
+| Passwords | Client Scrypt → HKDF split; server stores salted HMAC-SHA256 of the 256-bit `auth_key` |
 | Private keys and client state at rest | Own AEAD container (AES-256-GCM, metadata as AAD), file mode 0600 |
-| Transport | TLS 1.3 only. OpenSSL 3.5 defaults to hybrid X25519MLKEM768 key exchange |
+| Transport | TLS 1.3 only, hybrid X25519MLKEM768 (OpenSSL 3.5 default). Every command first asserts OpenSSL ≥ 3.5 for both `ssl` and `cryptography` |
 
 ## Architecture: three separate trust domains
 ```
-                 ┌───────────── Root CA (offline: key used only by `ping init-pki`)
+                 ┌───────────── Root CA (key used only by `ping init-pki` / `ping ca sign-server`)
                  │ signs
    ┌─────────────▼────────────┐   issue certs (TLS)   ┌───────────┐
-   │ CA service  `ping ca`    │◀──────────────────────│           │
+   │ CA service `ping ca serve`│◀─────────────────────│           │
    │ holds Sub-CA key         │   get_certs / get_crl │  client   │
    │ ca_service.py + ca store │──────────────────────▶│ (per user)│
    └──────────────────────────┘                       │           │
    ┌──────────────────────────┐   mTLS (user cert)    │           │
    │ Messaging server         │◀─────────────────────▶│           │
-   │ `ping server`            │  register/login/send/ └───────────┘
-   │ NO CA key, only Root cert│  inbox/get_certs
+   │ `ping server serve`      │  register/login/send/ └───────────┘
+   │ NO CA key, only Root cert│  inbox/ack/get_certs
    └──────────────────────────┘
 ```
-- **Two services, two processes, two data directories:**
-  - `ca_service.py`, run as `ping ca`. Sub-CA key in `keys/pki/sub/`, issuance records in `data/ca/`.
-  - `service.py` (messaging), run as `ping server`, data in `data/server/`.
-  - Both run on a generic `tlsserver.py` (ssl + ThreadingTCPServer + `protocol.py` framing). Each has its own TLS certificate from the Sub-CA (SAN `localhost`, different ports and CNs: `ping-ca` and `ping-server`).
+- **Two services, two processes, two homes:**
+  - `ca_service.py`, run as `ping ca serve`. Sub-CA key in `keys/pki/sub/`, issuance records in `data/ca/`.
+  - `service.py` (messaging), run as `ping server serve`, data in `data/server/`.
+  - Both run on a generic `tlsserver.py` (ssl + ThreadingTCPServer + `protocol.py` framing).
+- **Distinct service identities.** Each service has its own TLS certificate from the Sub-CA, with its own DNS SAN: `ca.ping.internal` (CN `ping-ca`) and `msg.ping.internal` (CN `ping-server`). Clients connect to `127.0.0.1:<port>` but pass the expected name as `server_hostname`. That way the CA's key can't pose as the messaging server, or the other way round. User certificates carry only a URI SAN `ping:user:<name>` and clientAuth, so they can never pass as a service. The username regex has no `-` or `.`, so a username can never collide with a service CN.
+- **Each service generates its own TLS key.** `ping server init` creates the server key and a CSR in the server home, and `ping ca sign-server` (offline, needs the Sub-CA passphrase) signs it. The CA-service TLS key is generated in the CA home by `init-pki`. No private key ever moves between homes.
 - **Backends:**
-  - `LocalBackend` holds a `CAService` and a `MessagingService` as separate objects. Only the CA object ever holds the Sub-CA key.
-  - `RemoteBackend` holds two TLS connections.
-  - `--mode remote|local`. Client crypto is the same in both modes.
+  - `RemoteBackend` holds two TLS connections (CA and messaging). This is the real deployment, and the only mode in which the trust-separation claims hold.
+  - `LocalBackend` holds a `CAService` and a `MessagingService` as separate objects over a shared home. They share no references, and only the CA object ever loads the Sub-CA key. It loads the key lazily, only when `issue` is called, so a local client that only logs in and chats never needs the Sub-CA passphrase.
+  - **Local mode trust model (stated in the report):** whoever runs a local client during sign-up holds the Sub-CA key in that process and can read `data/server/` directly. That's acceptable only because one operator controls every role. The MITM table below applies to remote mode.
+  - **Local mode across processes:** several local clients (Alice and Bob in two terminals) share `data/`. Every read-modify-write on shared state (issuance slot, KEM index, per-recipient sequence counter, account records) takes an `fcntl.flock` on a lock file next to it. Name claims use `O_CREAT|O_EXCL`, and every write is atomic via `os.replace`.
+  - `--mode remote|local`. Client crypto and the envelope pipeline are the same in both modes.
 - **mTLS policy, messaging server:**
   - `CERT_REQUIRED` for every request, including `register`. The user already has certificates from the CA by then.
   - The server checks that the client certificate's CN equals the request's username or the session's username.
   - The CRL is enforced in stage 2.
-- **CA service:** TLS with the server certificate only, because new users have no client certificate yet. `issue` is unauthenticated, first come first served. In a real system the CA would verify identity, for example by email; that's out of scope and stated in the report.
+- **CA service:** TLS with the server certificate only, because new users have no client certificate yet. `issue` is unauthenticated, first come first served. In a real system the CA would verify identity, for example by email. That's out of scope and stated in the report (see "Known limitations").
 
 ## End-to-end data flows
 
@@ -82,9 +93,10 @@ Already done: `uv add cryptography`. Nothing will be committed (global rule).
 | `(ss, c) ← Encaps(ek)`, `ss ← Decaps(dk, c)` | ML-KEM-768 |
 | `AEnc_K(N, m, AD)`, `ADec_K(N, c, AD)` | AES-256-GCM with nonce N and associated data AD (ADec outputs ⊥ on a bad tag) |
 | `KDF(ikm, info)` | HKDF-SHA256 |
+| `MAC_K(x)` | HMAC-SHA256 |
 | `H(x)` | SHA-256 |
 | `x ←$ {0,1}^n` | uniformly random n bits (`os.urandom`) |
-| `‖` | concatenation (in practice `canon()` encoding) |
+| `‖` | concatenation; in code always the `canon()` encoding, never raw byte concatenation |
 | `⊢ Root` | certificate chain verified to the pinned Root (validity, EKU/KeyUsage, CN) |
 | `TLS[...]`, `mTLS[Cert]` | TLS 1.3 channel (X25519MLKEM768), with client certificate for mTLS |
 
@@ -101,24 +113,24 @@ graph LR
   bob ---|TLS 1.3 - cert issuance| ca
   alice -.->|E2E envelope - ML-KEM + AES-GCM + ML-DSA| bob
 ```
-The server sees who → whom, when, and size. It cannot read, modify, forge, or MITM.
+The server sees who → whom, when, and size. It cannot read, modify or forge messages, and it cannot MITM a contact whose safety number has been verified (see "Closing the MITM gap" for first contact).
 
 ### PKI hierarchy (created by `ping init-pki`, once)
 ```mermaid
 graph TD
-  root["Root CA: ML-DSA-87, self-signed, offline, pinned"]
+  root["Root CA: ML-DSA-87, self-signed, pinned"]
   subca["Sub-CA: ML-DSA-65, CA, pathLen 0"]
-  catls["CA service TLS cert: serverAuth"]
-  srvtls["Messaging server TLS cert: serverAuth"]
-  usig["Cert_U sig: pk_U, clientAuth"]
-  ukem["Cert_U kem: ek_U, keyEncipherment"]
+  catls["CA service TLS cert: serverAuth, DNS ca.ping.internal"]
+  srvtls["Messaging server TLS cert: serverAuth, DNS msg.ping.internal"]
+  usig["Cert_U sig: pk_U, clientAuth, URI ping:user:U"]
+  ukem["Cert_U kem: ek_U, keyEncipherment, URI ping:user:U"]
   root -->|signed by sk_Root| subca
   subca -->|signed by sk_Sub| catls
   subca -->|signed by sk_Sub| srvtls
   subca -->|signed by sk_Sub| usig
   subca -->|signed by sk_Sub| ukem
 ```
-Every private key is stored as `AEnc_KEK(N, sk, AD = meta)` with `KEK = Scrypt(passphrase, salt)` (see Keystore). The Root key is never loaded again after bootstrap.
+Every private key is stored as `AEnc_KEK(N, sk, AD = meta)` with `KEK = Scrypt(passphrase, salt)` (see Keystore). The Root key is loaded only by `init-pki` and when re-issuing the Sub-CA. In the demo it sits in the CA home next to the Sub-CA key, under its own passphrase. In the report, "offline" means "never loaded by a running service"; a real deployment would keep it on an air-gapped machine.
 
 ### Flow 1: sign-up
 ```mermaid
@@ -131,19 +143,30 @@ sequenceDiagram
   Note over A: pw_key = Scrypt(pw, salt_A) (memory only, discarded after use)
   Note over A: K_auth, K_file, K_state = KDF(pw_key, "auth" / "keyfile" / "state")
   Note over A: (sk_A, pk_A) ← ML-DSA.KeyGen(), (dk_A, ek_A) ← ML-KEM.KeyGen()
-  Note over A: csr = Sig_sk_A(alice ‖ pk_A), pop = Sig_sk_A("kem-pop" ‖ alice ‖ H(ek_A))
-  A->>CA: TLS[ issue(csr, ek_A, pop) ]
-  Note over CA: Vrfy_pk_A(csr), Vrfy_pk_A(pop), alice has no active cert
+  Note over A: csr = Sig_sk_A(alice ‖ pk_A), bind = Sig_sk_A("kem-bind" ‖ alice ‖ H(ek_A))
+  A->>CA: TLS[ issue_begin(alice, csr, ek_A, bind) ]
+  Note over CA: Vrfy_pk_A(csr), Vrfy_pk_A(bind), CSR CN == alice
+  Note over CA: alice has no active cert, H(ek_A) never certified before
+  Note over CA: (ss, c) ← Encaps(ek_A), rid ←$ {0,1}^128, keep (rid, ss, request) 120 s
+  CA-->>A: TLS[ rid, c ]
+  Note over A: ss ← Decaps(dk_A, c), t = MAC_KDF(ss, "ping/v1/kem-pop")(rid ‖ H(csr) ‖ H(ek_A))
+  A->>CA: TLS[ issue_finish(rid, t) ]
+  Note over CA: verify t (constant time, single use), claim slot "alice" atomically (O_EXCL)
   Note over CA: Cert_A^sig = Sig_sk_Sub(alice ‖ pk_A ‖ clientAuth)
   Note over CA: Cert_A^kem = Sig_sk_Sub(alice ‖ ek_A ‖ keyEncipherment)
   CA-->>A: TLS[ Cert_A^sig, Cert_A^kem, Cert_Sub ]
   Note over A: Cert_A^sig ⊢ Root, Cert_A^kem ⊢ Root, certified keys == (pk_A, ek_A)
   Note over A: store AEnc_K_file(N, sk_A, AD=meta) and AEnc_K_file(N', dk_A, AD=meta')
+  Note over A: create sealed history.json and contacts.json (empty)
   A->>S: mTLS[Cert_A^sig][ register(alice, K_auth, Cert_A^sig, Cert_A^kem) ]
-  Note over S: certs ⊢ Root, CN == TLS peer CN == alice
-  Note over S: store Scrypt(K_auth, salt_S) and certs
+  Note over S: certs ⊢ Root, Cert_A^sig == TLS peer cert (byte-equal), CN == alice
+  Note over S: no account "alice" yet
+  Note over S: salt_S ←$ {0,1}^128, store MAC_salt_S(K_auth) and certs
   S-->>A: mTLS[ ok ]
 ```
+`bind` ties the KEM key to the signing identity. The `Encaps` → `t` round trip is the real proof that Alice holds `dk_A`, because a KEM key can't sign anything. Without it, Mallory could get Bob's `ek` certified under her own name.
+
+If `register` fails (server down, network error), the client keeps the issued certificates and offers "resume registration" on the next run. The CA slot is already taken, so without this a crash between the two steps would lose the username for good (there's no revocation in stage 1).
 
 ### Flow 2: login
 ```mermaid
@@ -155,19 +178,23 @@ sequenceDiagram
   Note over A: pw_key = Scrypt(pw, salt_A), then KDF gives K_auth, K_file, K_state
   Note over A: sk_A = ADec_K_file(N, c_sk, AD=meta), dk_A likewise
   Note over A: ADec fails = wrong password or tampered file, abort
+  Note over A: key files exist but a state file is missing = tampering, abort
   Note over A: sk_A loaded into ssl via one-time-password temp file (deleted at once)
   A->>S: mTLS[Cert_A^sig][ login(alice, K_auth) ]
   Note over S: TLS peer CN == alice
-  Note over S: Scrypt.Verify(K_auth, hash), dummy verify if unknown user
+  Note over S: compare_digest(MAC_salt_S(K_auth), stored)
   S-->>A: mTLS[ token ←$ {0,1}^256 ]  (memory only, 30 min)
 ```
+**What login proves, honestly.** mTLS proves possession of `sk_A`, and `sk_A` is sealed under the same password. So the server's password check is defense in depth, not a second, independent factor. Someone who steals the laptop can brute-force the password offline against the key file; Scrypt with n=2^17 only slows that down. The server check still helps if a decrypted key leaks from memory without the password, and the session token is bound to it.
 
 ### Flow 3: send (A → B) and receive
 Envelope: `E = (h, N, c, {(c_R, N_R, w_R)} for R ∈ {B, A}, σ)`, where
-- `h = (id, A, B, ts, H(Cert_A^sig), H(Cert_B^kem))`, with `id ←$ {0,1}^128`
+- `h = (id, A, B, ts, H(Cert_A^sig), H(Cert_B^kem), H(Cert_A^kem), commit)`, with `id ←$ {0,1}^128` and `commit = MAC_CEK("ping/v1/commit")`
 - `c = AEnc_CEK(N, m, AD = h)`, with `CEK ←$ {0,1}^256` and `N ←$ {0,1}^96`
-- `(ss_R, c_R) ← Encaps(ek_R)`, `KEK_R = KDF(ss_R, "wrap" ‖ R ‖ H(h))`, `w_R = AEnc_KEK_R(N_R, CEK, AD = R)`
+- `(ss_R, c_R) ← Encaps(ek_R)`, `KEK_R = KDF(ss_R, "ping/v1/wrap" ‖ R ‖ H(h))`, `w_R = AEnc_KEK_R(N_R, CEK, AD = R)`
 - `σ = Sig_sk_A(h ‖ N ‖ c ‖ wraps)`
+
+The sender's own wrap lets Alice re-read what she sent from any later inbox sync. Because `commit` is in the signed header, every reader checks that its unwrapped CEK is the one committed to. So a malicious sender can't wrap different CEKs for Bob and for herself and have one ciphertext decrypt to two different messages (AES-GCM alone is not key-committing).
 
 ```mermaid
 sequenceDiagram
@@ -178,72 +205,84 @@ sequenceDiagram
   A->>S: mTLS[Cert_A^sig][ get_certs(bob) ]
   S-->>A: Cert_B^sig, Cert_B^kem
   Note over A: Cert_B^kem ⊢ Root, CN = bob, keyEncipherment
-  Note over A: H(Cert_B) == TOFU pin, else STOP (verify safety number)
-  Note over A: CEK ←$ {0,1}^256, N ←$ {0,1}^96
+  Note over A: no pin: pin now as "unverified"; pin differs: STOP (KeyChanged)
+  Note over A: CEK ←$ {0,1}^256, N ←$ {0,1}^96, commit = MAC_CEK("ping/v1/commit")
   Note over A: c = AEnc_CEK(N, m, AD=h)
   Note over A: for R in {B, A}: (ss_R, c_R) ← Encaps(ek_R)
-  Note over A: KEK_R = KDF(ss_R, "wrap" ‖ R ‖ H(h)), w_R = AEnc_KEK_R(N_R, CEK, AD=R)
+  Note over A: KEK_R = KDF(ss_R, "ping/v1/wrap" ‖ R ‖ H(h)), w_R = AEnc_KEK_R(N_R, CEK, AD=R)
   Note over A: σ = Sig_sk_A(h ‖ N ‖ c ‖ wraps)
   A->>S: mTLS[ send(token, E) ]
-  Note over S: TLS peer CN == session user == h.sender
-  Note over S: store E under messages/bob/ (opaque, holds no dk)
-  S-->>A: ok
-  B->>S: mTLS[Cert_B^sig][ inbox(token) ]
+  Note over S: TLS peer CN == session user == h.sender, recipient exists, quota ok
+  Note over S: seq ← next_seq(bob), store messages/bob/<seq>.json (opaque, holds no dk)
+  S-->>A: ok(seq)
+  Note over A: history = AEnc_K_state(history ∪ {sent: id, bob, ts, m})
+  B->>S: mTLS[Cert_B^sig][ wait_inbox(token, since_seq) ]
   Note over S: TLS peer CN == session user == bob
-  S-->>B: [E, ...]
-  Note over B: (1) Cert_A^sig ⊢ Root, CN = h.sender, matches TOFU pin
+  S-->>B: [(seq, E), ...]
+  Note over B: (1) Cert_A^sig ⊢ Root, CN = h.sender, pin (or pin now as unverified)
   Note over B: (2) Vrfy_pk_A(h ‖ N ‖ c ‖ wraps, σ)
-  Note over B: (3) h.recipient == bob, H(Cert_B^kem) matches, id not seen
+  Note over B: (3) h.recipient == bob, H(Cert_B^kem) matches
   Note over B: any failure in (1) to (3): REJECT, never decrypt
-  Note over B: (4) ss_B ← Decaps(dk_B, c_B), KEK_B = KDF(ss_B, "wrap" ‖ B ‖ H(h))
-  Note over B: (5) CEK = ADec_KEK_B(N_B, w_B, AD=B), m = ADec_CEK(N, c, AD=h)
-  Note over B: (6) seen = AEnc_K_state(seen ∪ {id})
+  Note over B: (4) id already in history: skip as duplicate (audit), go to (7)
+  Note over B: (5) ss_B ← Decaps(dk_B, c_B), KEK_B = KDF(ss_B, "ping/v1/wrap" ‖ B ‖ H(h))
+  Note over B: (6) CEK = ADec_KEK_B(N_B, w_B, AD=B), MAC_CEK(...) == commit, m = ADec_CEK(N, c, AD=h)
+  Note over B: (6b) history = AEnc_K_state(history ∪ {received or rejected: id, alice, ts, m or reason})
+  B->>S: mTLS[ ack(token, [seq, ...]) ]
+  Note over S: delete messages/bob/<seq>.json
 ```
+**Delivery is at-least-once with de-duplication.** The server keeps an envelope until the recipient acks it. Bob writes his sealed history before acking, so a crash in between causes a redelivery, which step (4) skips. Rejected envelopes are acked too, and recorded in history with their reason, so they show up once instead of being re-fetched forever. Read messages live in Bob's sealed `history.json`, not on the server. That's what keeps history readable after logging in again, and it's the main "user data stored under authenticated encryption" in the app.
 
 ## Sign-up flow
 1. The client generates ML-DSA-65 and ML-KEM-768 key pairs.
-2. **Client → CA `issue`** with:
+2. **Client → CA `issue_begin`** with:
+   - the username
    - an ML-DSA CSR (CN = username)
    - the ML-KEM public key
-   - a KEM proof of possession: `ML-DSA.sign(canon({username, kem_pub_fp, "ping/kem-pop"}))`
+   - a binding signature: `ML-DSA.sign(canon({username, kem_pub_fp, "ping/kem-bind"}))`
 3. **The CA checks the request:**
-   - the CSR signature is valid and the proof-of-possession signature verifies under the CSR's key
-   - the username is valid and has **no active certificate** (one active pair per username). Re-issuing needs revocation first (stage 2).
-4. **The CA builds both certificates itself.** It ignores the requested extensions, sets the subject, SAN `ping:user:<name>`, KeyUsage and EKU, then signs. It writes an issuance record to `data/ca/issued/<user>.json` and returns the certificates plus the chain.
-5. **The client verifies the certificates:** chain to the pinned root, CN = username, and the public keys equal its own. It then seals and saves the keys.
-6. **Client → server `register`** over mTLS, presenting the new signing certificate. It sends:
+   - the CSR signature is valid, the CSR CN equals the username field, and the binding signature verifies under the CSR's key
+   - the username matches `^[a-z0-9_]{3,32}$` and has **no active certificate** (one active pair per username). Re-issuing needs revocation first (stage 2).
+   - the KEM public key has never been certified before (index `data/ca/kem_index/<H(ek)>`)
+4. **KEM proof of possession.** The CA encapsulates to the submitted `ek` and returns `(rid, kem_ct)`. The client decapsulates and sends `issue_finish(rid, t)`, with `t = HMAC(HKDF(ss, "ping/v1/kem-pop"), canon({rid, H(csr), H(ek)}))`. Pending challenges live in memory for 120 s and can be used once.
+5. **The CA builds both certificates itself.** It ignores any extensions requested in the CSR, sets the subject, the SAN `ping:user:<name>`, KeyUsage and EKU, then signs. It claims the name by creating `data/ca/issued/<user>.json` with `O_CREAT|O_EXCL`, so two concurrent requests for the same name (threads or local processes) can't both succeed. It returns the certificates plus the chain.
+6. **The client verifies the certificates:** chain to the pinned root, CN = username, and the public keys equal its own. It then seals and saves the keys, and creates empty sealed `history.json` and `contacts.json`.
+7. **Client → server `register`** over mTLS, presenting the new signing certificate. It sends:
    - the username
    - `auth_key`
    - both certificates
 
-   The server verifies the certificates against the Root, checks that CN = username, and stores the account.
+   The server verifies both certificates against the Root. It checks that the submitted signing certificate is byte-for-byte the TLS peer certificate, that both CNs equal the username, and that no account exists yet. Then it stores the account.
 
 ## Closing the MITM gap
-Who could attempt a MITM, and why it fails:
+Who could attempt a MITM, and why it fails. This table applies to remote mode; local mode is single-operator.
 
 | Adversary | Attempt | Why it fails |
 |---|---|---|
-| Network attacker | Intercept or alter traffic | TLS 1.3 with the server certificate chained to the pinned Root; mTLS on the messaging server; the E2E layer underneath |
+| Network attacker | Intercept or alter traffic | TLS 1.3 with the service certificate chained to the pinned Root and checked against its expected DNS name; mTLS on the messaging server; the E2E layer underneath |
 | **Malicious messaging server** | Hand Alice a fake "bob" KEM certificate so it can decrypt | It has no CA key, so it can't create a certificate that chains to the Root. Clients verify every certificate they receive. |
+| Malicious messaging server | Get a real CA certificate for someone else's KEM key | KEM proof of possession: the CA certifies an `ek` only if the requester could decapsulate its challenge, and never certifies the same `ek` twice. |
 | Malicious messaging server | Serve an old revoked Bob certificate | Clients check the CA's CRL (stage 2), and the CA allows one active pair per name |
-| Malicious messaging server | Register as "bob" before Bob does | That's squatting, not a MITM. The CA refuses the real Bob's registration, so it's visible. Prevented properly only by identity proofing, which is out of scope. |
-| **Compromised CA service** | Issue a second valid "bob" pair | **Key pinning (trust on first use, TOFU):** the client pins each contact's certificate fingerprints on first contact in `data/clients/<me>/contacts.json` (sealed). Any change → hard stop: "bob's keys changed – verify". **Safety numbers:** `verify <contact>` shows `SHA-256(sorted(my sign+kem fps ‖ their fps))` as 12 groups of 5 digits. The two users compare them in person and mark the contact verified. A key change on a verified contact is never accepted silently. |
-| Root CA compromise | Anything | Same pinning and safety numbers. Out of scope beyond that; the key is offline. |
+| Malicious messaging server, or anyone | Register as "bob" before Bob does, by calling the unauthenticated CA `issue` itself | That's squatting, not a MITM: the squatter holds the only "bob" keys, and the real Bob's sign-up is refused, so it's visible. Prevented properly only by identity proofing, which is out of scope. |
+| Malicious messaging server | Replay, re-address or overwrite stored mail | The server assigns its own per-recipient sequence number, so a sender can't choose the storage filename. The signature covers the recipient and its key fingerprint. A duplicate `msg_id` is skipped against the sealed history. |
+| CA service key | Pose as the messaging server | Distinct DNS SANs; clients require `msg.ping.internal` on the messaging port. |
+| **Compromised CA service** | Issue a second valid "bob" pair | **Key pinning (trust on first use, TOFU):** the first time Alice sends to or receives from Bob, the client pins Bob's certificate fingerprints in `contacts.json` (sealed) and marks him **unverified**. Messages from an unverified contact display as `[bob ? unverified]`; sending to one is allowed with a warning. Any later change → hard stop: "bob's keys changed – verify". **Safety numbers:** `verify <contact>` shows `SHA-256(canon(sorted([my sign fp, my kem fp, their sign fp, their kem fp])))` as 12 groups of 5 digits. The two users compare them in person and mark the contact verified. A key change on a verified contact is never accepted silently. **Caveat for the report:** a substitution on the very first contact is caught only once the safety numbers are compared. |
+| Root CA compromise | Anything | Same pinning and safety numbers. Out of scope beyond that. |
 
-What stays possible: the server can see metadata and can drop or delay messages. It can't read, modify, forge or MITM them.
+What stays possible: the server can see metadata, and can drop or delay messages. It can't read, modify or forge them, and it can't MITM a verified contact.
 
 ## Keystore: authenticated encryption of private keys (`keystore.py`)
-Every private key file (Root CA, Sub-CA, two TLS keys, user sign and KEM) is a JSON container:
+Every private key file (Root CA, Sub-CA, two TLS keys, user sign and KEM) and every sealed client-state file is a JSON container:
 ```json
 {"v":1, "alg":"AES-256-GCM", "kdf":{"name":"scrypt","n":131072,"r":8,"p":1,"salt":"<16B>"} | {"name":"login"},
- "owner":"alice", "role":"user-sign|user-kem|root-ca|sub-ca|ca-tls|server-tls",
- "pub_fp":"<sha256 of public key DER>", "nonce":"<12B>", "ct":"<GCM(PKCS#8 DER)‖tag>"}
+ "owner":"alice", "role":"user-sign|user-kem|root-ca|sub-ca|ca-tls|server-tls|state-history|state-contacts",
+ "pub_fp":"<sha256 of public key DER, empty for state>", "nonce":"<12B>", "ct":"<GCM(payload)‖tag>"}
 ```
 - **Wrapping key (KEK):**
   - CA and server keys: `Scrypt(passphrase, salt)`, with the parameters stored in the file.
   - User keys: `keyfile_key = HKDF(pw_key, info="ping/keyfile")`.
-- **Encryption:** `ct = AESGCM(kek).encrypt(urandom(12), pkcs8_der, aad=canon({v, alg, kdf, owner, role, pub_fp}))`.
-  - Swapping files, changing the owner or role, or editing the KDF parameters (a downgrade) all break the tag.
+  - Client state: `state_key = HKDF(pw_key, info="ping/state")`.
+- **Encryption:** `ct = AESGCM(kek).encrypt(urandom(12), payload, aad=canon({v, alg, kdf, owner, role, pub_fp}))`.
+  - Swapping files, changing the owner or role, or editing the KDF parameters (a downgrade) all break the tag. That includes swapping `history.json` and `contacts.json`, because they have different roles.
 - **Opening:**
   1. `InvalidTag` means a wrong passphrase or a tampered file. The two can't be told apart, by design.
   2. Check that the public key's SHA-256 equals `pub_fp`.
@@ -251,21 +290,24 @@ Every private key file (Root CA, Sub-CA, two TLS keys, user sign and KEM) is a J
 - **Writes** are atomic (temporary file + `os.replace`), mode 0600, with a fresh nonce on every re-encryption.
 - **Getting a key into `ssl`.** `load_cert_chain` only accepts file paths. So:
   1. The decrypted key is re-serialized as PKCS#8 encrypted with a random 32-byte one-time password, held only in memory.
-  2. It's written to a `mkdtemp()` directory with mode 0700.
-  3. `load_cert_chain(cert, tmp, password=otp)` is called, and the file is deleted in a `finally` block.
+  2. It's written to `mkdtemp(dir=<home>/run)`. That directory has mode 0700 and is inside the repo, never the system temp directory.
+  3. `load_cert_chain(cert, tmp, password=otp)` is called, and the file and directory are deleted in a `finally` block.
 
   The disk never holds the key unencrypted, and the temporary copy's password never touches disk.
-- **Sealed client state:** the replay cache (`seen.json`) and the contact pins (`contacts.json`) use the same container with `HKDF(pw_key, "ping/state")`. Editing or deleting them is detected.
+- **Sealed client state:** `history.json` holds sent and received messages, rejected envelopes with their reason, and so the set of seen `msg_id`s. `contacts.json` holds pins and verified flags. Both use `state_key`.
+  - **Detected:** any edit; swapping the two files; swapping in another user's files.
+  - **Detected:** deleting a state file while the user's key files still exist. Sign-up creates them together, so the client refuses to start and tells the user to run `ping client --reset-state` explicitly.
+  - **Not detected (stated limitation):** rolling back to an older, validly sealed copy. Both versions verify under the same `state_key`, and there is no trusted monotonic storage to compare against. Rolling back `contacts.json` could undo a pin. Rolling back `history.json`, combined with a malicious server that kept a copy of an acked envelope, could get an old message shown again.
 
 ## Secrets: validation and how they get loaded
 ### CA and server passphrases
-- **Creation (`init-pki`):**
+- **Creation (`init-pki`, `server init`):**
   - Prompted with `getpass`, entered twice, minimum 12 characters.
   - Separate passphrases for the Root CA, Sub-CA, CA-service TLS and messaging-server TLS.
   - Each key is stored as a keystore container. No passphrase hash is stored anywhere.
 - **Validation:**
   1. The GCM tag over the key and its metadata verifies, or `InvalidTag` is raised ("wrong passphrase or corrupted key file").
-  2. Then the `pub_fp` check and `assert_pair(private_key, cert)` confirm the key belongs to the certificate on disk (catches a swapped certificate).
+  2. Then the `pub_fp` check and `assert_pair(private_key, cert)` confirm the key belongs to the certificate on disk (this catches a swapped certificate).
 
   Three failed attempts → exit.
 - **How keys are loaded into the process:** `config.get_passphrase(name)`:
@@ -274,34 +316,38 @@ Every private key file (Root CA, Sub-CA, two TLS keys, user sign and KEM) is a J
 
   There is no plain env var holding the passphrase, because it would be visible in the process environment.
 - **Who holds which key at runtime:**
-  - `ping ca`: the Sub-CA key in memory, plus its own TLS key.
-  - `ping server`: only its TLS key, plus the Root certificate.
+  - `ping ca serve`: the Sub-CA key in memory, plus its own TLS key.
+  - `ping server serve`: only its TLS key, plus the Root certificate.
+  - Local-mode client: the Sub-CA key only while `register` runs, then dropped.
   - The Root CA key is loaded only inside `init-pki` (and when re-issuing the Sub-CA).
   - Limitation for the report: Python can't reliably wipe secrets from memory.
 
 ### Trust anchor
 - `init-pki` prints the Root certificate's SHA-256 fingerprint.
-- The client reads `keys/pki/root/root_ca.crt.pem` and stores its pinned fingerprint in `data/clients/trust.json`. The user confirms it on first run; after that a mismatch is a hard failure.
+- The client reads the Root certificate given by `--root-cert` (in a fresh home) and stores its pinned fingerprint in `data/clients/trust.json`. The user confirms it on first run. After that, a mismatch is a hard failure.
 - The root is the only anchor in `ssl` (`load_verify_locations`) and in `x509.verification.Store`. System CAs are never loaded.
 
 ### User passwords
-1. `client_salt` is generated at sign-up and kept in `data/clients/<user>/profile.json`. It's public, and the server never needs it. Keeping it local breaks the cycle where login needs mTLS, mTLS needs the signing key, and the signing key needs the salt. It also removes any username-probing endpoint.
-2. `pw_key = Scrypt(password, client_salt, n=2^17, r=8, p=1)`. This is the password-derived key: **never stored, never sent**. It's recomputed at each sign-up or login and dropped once the three keys below are derived. The keys that stay local (`keyfile_key`, `state_key`) are kept in memory only for the session.
-3. Derive three independent keys from `pw_key` with HKDF. One expensive Scrypt, then cheap domain-separated splits. Because HKDF is one-way, leaking one key reveals nothing about the others.
+1. Minimum 12 characters, checked at sign-up and at password change.
+2. `client_salt` is generated at sign-up and kept in `data/clients/<user>/profile.json`. It's public, and the server never needs it. Keeping it local breaks the cycle where login needs mTLS, mTLS needs the signing key, and the signing key needs the salt.
+3. `pw_key = Scrypt(password, client_salt, n=2^17, r=8, p=1)`. This is the password-derived key: **never stored, never sent**. It's recomputed at each sign-up or login and dropped once the three keys below are derived. The keys that stay local (`keyfile_key`, `state_key`) are kept in memory only for the session.
+4. Derive three independent keys from `pw_key` with HKDF. One expensive Scrypt, then cheap domain-separated splits. Because HKDF is one-way, leaking one key reveals nothing about the others.
    - `auth_key` (`info="ping/auth"`): sent to the server over mTLS.
    - `keyfile_key` (`info="ping/keyfile"`): stays local.
    - `state_key` (`info="ping/state"`): stays local.
-4. The server stores `Scrypt(auth_key, server_salt)` together with its parameters. It checks with `Scrypt.verify` (constant time), and does a dummy verify for unknown users. The server never sees anything that decrypts the key files.
-5. **Why split the password's job at all:** the password has to unlock the local private keys and also authenticate to the server. Splitting it means the server, or anyone who steals `auth_key` from it, can at most log in. They can't decrypt the key files or read messages, and the plain password never leaves the client (which also protects users who reuse passwords).
-6. **Known limitation (report and defense):** `auth_key` is enough to log in, just as the password would be. It's protected by TLS in transit and by Scrypt at rest on the server. A PAKE protocol (for example OPAQUE) would remove that, and is noted as future work.
+5. The server stores `HMAC-SHA256(server_salt, auth_key)` with a fresh 16-byte `server_salt`, and checks with `hmac.compare_digest`. It doesn't run a second Scrypt: `auth_key` already comes out of a memory-hard Scrypt and has 256 bits of entropy, so a slow hash would add no security. It would only let anyone with a (free) certificate tie up 128 MB of server memory per login attempt. The server never sees anything that decrypts the key files or the state.
+6. **Why split the password's job at all:** the password has to unlock the local private keys and also authenticate to the server. Splitting it means the server, or anyone who steals `auth_key` from it, can at most log in. They can't decrypt the key files or read messages, and the plain password never leaves the client (which also protects users who reuse passwords).
+7. **Known limitation (report and defense):** `auth_key` is enough to pass the password check, just as the password would be. It's protected by TLS in transit, and only an HMAC of it is stored. Logging in also needs the user's mTLS key, though. A PAKE protocol (for example OPAQUE) would remove that, and is noted as future work.
+8. **Username enumeration is not prevented, and not claimed.** CA `issue` refuses taken names and `get_certs` answers for any name. In a messenger the user directory is effectively public, so there's no dummy-verify timing defense.
 
 ## How the envelope is protected
-Wire and disk format: JSON, binary fields base64url.
+Wire and disk format: JSON, binary fields base64url without padding.
 ```json
 {
   "header":  {"v":1, "msg_id":"<16B rand>", "sender":"alice", "recipient":"bob",
               "ts":"2026-10-26T19:00:00Z", "sender_sign_cert_fp":"<sha256>",
-              "recipient_kem_cert_fp":"<sha256>"},
+              "sender_kem_cert_fp":"<sha256>", "recipient_kem_cert_fp":"<sha256>",
+              "cek_commit":"<32B>"},
   "body":    {"nonce":"<12B>", "ct":"<AES-GCM ciphertext‖tag>"},
   "wraps":   {"bob":   {"kem_ct":"<1088B>", "nonce":"<12B>", "wrapped_cek":"<48B>"},
               "alice": {"kem_ct":"…", "nonce":"…", "wrapped_cek":"…"}},
@@ -310,44 +356,62 @@ Wire and disk format: JSON, binary fields base64url.
 ```
 `canon(x)` = `json.dumps(x, sort_keys=True, separators=(",",":"), ensure_ascii=True).encode()`. It's deterministic, so the signer and the verifier process exactly the same bytes.
 
+**Strict parsing.** `parse_envelope` rejects:
+- duplicate JSON keys (via `object_pairs_hook`)
+- unknown or missing fields
+- a `wraps` object whose keys aren't exactly `{sender, recipient}`
+- non-canonical base64url: every binary field must re-encode to exactly the string received
+
+Without that last check, a flipped padding bit could change the stored file without changing the decoded bytes, and the tamper demo would show nothing.
+
 **Sealing (on Alice's client):**
-1. Resolve Bob's certificates. Check the chain to the pinned root, CN, purpose, validity, and the TOFU pin. A missing or changed pin stops the send until the user verifies.
-2. `cek = urandom(32)`, `n = urandom(12)`.
-3. `body.ct = AESGCM(cek).encrypt(n, plaintext, aad=canon(header))`. This gives confidentiality and integrity, and binds the header (the AAD) to the body.
-4. For each reader R in {recipient, sender}:
+1. Refuse `recipient == sender`, so the two wraps never collide.
+2. Resolve Bob's certificates. Check the chain to the pinned root, CN, purpose, validity and the pin. On first contact, pin him as unverified; if the pin has changed, stop with `KeyChanged`.
+3. `cek = urandom(32)`, `n = urandom(12)`, `header.cek_commit = HMAC(cek, "ping/v1/commit")`.
+4. `body.ct = AESGCM(cek).encrypt(n, plaintext, aad=canon(header))`. This gives confidentiality and integrity, and binds the header (the AAD) to the body.
+5. For each reader R in {recipient, sender}:
    1. `(ss, kem_ct) = R_kem_pub.encapsulate()`.
-   2. `kek = HKDF-SHA256(ss, info="ping/v1/wrap" ‖ R ‖ sha256(canon(header)))`.
-   3. `wrapped_cek = AESGCM(kek).encrypt(n_R, cek, aad=R)`.
-5. `sig = alice_sign.sign(canon({header, body, wraps}))`. The signature covers everything, including both names and the recipient key fingerprint. That stops a forwarded or re-addressed copy from being accepted.
+   2. `kek = HKDF-SHA256(ss, info=canon({"ctx":"ping/v1/wrap", "r":R, "h":sha256(canon(header))}))`.
+   3. `wrapped_cek = AESGCM(kek).encrypt(n_R, cek, aad=canon({"r":R}))`.
+6. `sig = alice_sign.sign(canon({header, body, wraps}))`, computed over the base64url strings exactly as they go on the wire. The signature covers everything, including both names and both KEM certificate fingerprints. That stops a forwarded or re-addressed copy from being accepted.
+7. After the server returns `ok`, append the message to Alice's sealed history as sent.
 
-**Opening (on Bob's client).** Fail-closed, in this order:
-1. **Chain and pin:** resolve the certificate by `sender_sign_cert_fp`. Verify the chain to the root, validity, EKU, CN = `header.sender`, and the TOFU pin.
+**Opening (on the reader's client: Bob, or Alice re-reading her own copy).** Fail-closed, in this order:
+1. **Chain and pin:** resolve the certificate by `sender_sign_cert_fp`. Verify the chain to the root, validity, EKU, CN = `header.sender`, and the pin (first contact: pin as unverified).
 2. **Signature:** verify `sig` over `canon({header, body, wraps})`.
-3. **Addressing:** `recipient == me`, `recipient_kem_cert_fp == my KEM certificate`, and `msg_id` isn't in the sealed `seen.json`.
-4. **Unwrap:** decapsulate → HKDF → unwrap the CEK.
-5. **Decrypt:** decrypt the body with `aad=canon(header)`, then record `msg_id` as seen.
+3. **Addressing:** I am `recipient` (or `sender`, for my own copy), and the matching `*_kem_cert_fp` is my KEM certificate.
+4. **Duplicate:** `msg_id` already in sealed history → skip silently (audit `duplicate`), but still ack.
+5. **Unwrap:** decapsulate → HKDF → unwrap the CEK, then check `HMAC(cek, "ping/v1/commit") == cek_commit`. This makes AES-GCM key-committing.
+6. **Decrypt:** decrypt the body with `aad=canon(header)`.
+7. **Record, then ack:** write the message (or the rejection reason) to sealed history, then `ack` its sequence number so the server deletes it.
 
-When the messaging server accepts an upload, it also checks that the mTLS CN, the session username and `header.sender` all match. That's defense in depth; clients don't rely on it.
+When the messaging server accepts an upload, it also checks that the mTLS CN, the session username and `header.sender` all match, and that the recipient exists. That's defense in depth; clients don't rely on it. The server never uses `msg_id` or `ts` for storage or ordering; it assigns its own per-recipient sequence number.
 
 ## Files (new unless noted)
 - `pyproject.toml` (modify): `[project.scripts] ping = "ping.cli:main"`, uv_build backend, description, pytest dev dependency.
 - `main.py` (modify): shim calling `ping.cli.main`.
-- `.gitignore` : `.venv/`, `__pycache__/`, `.pytest_cache/`, `keys/`, `data/`, `logs/`, `demo/`, `.DS_Store`.
+- `.gitignore` : `.venv/`, `__pycache__/`, `.pytest_cache/`, `keys/`, `data/`, `logs/`, `run/`, `demo/`, `.DS_Store`.
 - `scripts/demo.sh`: optional tmux launcher for the four-pane demo. Without tmux it prints the plain four-terminal commands (see "Demo setup").
+- `scripts/evil_server.py`: the MITM demo. A messaging server that substitutes a rogue-CA certificate. It is kept out of the real CLI on purpose, so the shipped binary has no "be malicious" flag.
 
 ## Runtime directory layout (all gitignored, root = `PING_HOME`, default the repo root)
 ```text
 keys/                              # ALL key material and certificates
-  pki/root/   root_ca.key.json  root_ca.crt.pem          # Root key: only used by init-pki
-  pki/sub/    sub_ca.key.json   sub_ca.crt.pem  sub_ca.crl.pem
-  pki/tls/    ca.key.json  ca.crt.pem  server.key.json  server.crt.pem
-  users/<u>/  sign.key.json  kem.key.json  sign.crt.pem  kem.crt.pem
+  pki/root/   root_ca.key.json  root_ca.crt.pem          # key: CA home only; .crt copied to others
+  pki/sub/    sub_ca.key.json   sub_ca.crt.pem  sub_ca.crl.pem   # CA home only
+  tls/        ca.key.json  ca.crt.pem                    # CA home
+  tls/        server.key.json  server.csr.pem  server.crt.pem    # server home
+  users/<u>/  sign.key.json  kem.key.json  sign.crt.pem  kem.crt.pem   # client home
 data/                              # app state, no private keys
-  ca/issued/<u>.json               # CA issuance records
-  server/users/<u>.json            # Scrypt(K_auth) + certs
-  server/messages/<recipient>/<id>.json   # E2E envelopes
+  ca/issued/<u>.json               # CA issuance records (created O_EXCL)
+  ca/kem_index/<H(ek)>             # every KEM key ever certified
+  server/users/<u>.json            # HMAC(K_auth) + certs
+  server/messages/<recipient>/<seq>.json   # E2E envelopes, deleted on ack
+  server/messages/<recipient>/.seq         # counter, updated under flock
+  server/audit.log                 # stage 2: hash-chained audit entries
   clients/trust.json               # pinned Root fingerprint
-  clients/<u>/  profile.json  seen.json  contacts.json   # last two sealed
+  clients/<u>/  profile.json  history.json  contacts.json   # last two sealed
+run/                               # mode 0700, short-lived ssl key temp dirs
 logs/                              # JSON-lines app + audit logs (redacted)
   ca.log  server.log  client-<u>.log
 ```
@@ -362,109 +426,137 @@ logs/                              # JSON-lines app + audit logs (redacted)
 - `ping init-pki` refuses to overwrite an existing `keys/pki/`. To reset: `rm -rf keys data`.
 - Tests and the tamper demo set `PING_HOME` to a temporary directory, so they never touch the repo's `keys/` or `data/`. One-off probes and scratch scripts write only to the session scratchpad, never the repo.
 - **`src/ping/` core:**
-  - `config.py`: paths, `get_passphrase`, `now()` clock that tests can override, `KdfParams`.
+  - `config.py`: paths, `get_passphrase`, `now()` clock that tests can override, `KdfParams`, and `check_openssl()`. Every command calls `check_openssl()` first; it asserts OpenSSL ≥ 3.5 for both `ssl.OPENSSL_VERSION_INFO` and `cryptography`'s backend, because the two libraries can link different OpenSSL builds on another machine.
   - `log.py`: `setup_logging(role, home, trace)`, `trace(step, **sizes)` (crypto trace), `audit(event, **fields)`, `RedactingFilter`, `req_id`/`msg_id` context variables (see "Logging and observability").
-  - `storage.py`: atomic JSON store, username regex `^[a-z0-9_]{3,32}$`.
-  - `auth.py`: client-side derivation, server-side hash and verify.
+  - `storage.py`: atomic JSON store, `create_exclusive`, `locked(path)` (`fcntl.flock`), username regex `^[a-z0-9_]{3,32}$`.
+  - `auth.py`: client-side derivation, server-side HMAC and verify.
   - `keystore.py`: `seal_key`, `open_key`, `assert_pair`, `ssl_load_key`, `seal_state`, `open_state`.
 - **`src/ping/` PKI and messaging:**
-  - `pki.py`: Root, Sub-CA and TLS certificate creation, user certificate issuance, CSR and proof-of-possession helpers, `verify_cert(cert, purpose, at)`, fingerprints.
+  - `pki.py`: Root, Sub-CA and TLS certificate creation, user certificate issuance, CSR, KEM binding and KEM proof-of-possession helpers, `verify_cert(cert, purpose, at)`, fingerprints.
   - `contacts.py`: TOFU pins, safety numbers, the verified flag.
-  - `messaging.py`: `canon`, `seal`, `open_envelope`, `MessageRejected(reason)`.
+  - `history.py`: sealed message history and the seen-id lookup.
+  - `messaging.py`: `canon`, strict `parse_envelope`, `seal`, `open_envelope`, `MessageRejected(reason)`.
 - **`src/ping/` services and transport:**
-  - `ca_service.py`: `issue`, `get_certs`, the issuance store, and (stage 2) revoke and CRL.
-  - `service.py`: messaging — register, login, logout, get_certs, send, inbox, `wait_inbox(token, since, timeout≤25 s)` (long-poll), `status` (stage 2).
+  - `ca_service.py`: `issue_begin`, `issue_finish`, `get_certs`, the issuance store, `sign_server_csr`, and (stage 2) revoke and CRL.
+  - `service.py`: messaging — register, login, logout, get_certs, send, `wait_inbox(token, since_seq, timeout≤25 s)` (long-poll; `timeout=0` is a plain inbox fetch), `ack(token, seqs)`, and `status` (stage 2). It keeps a per-recipient lock and sequence counter, and at most 500 pending envelopes per recipient (`inbox_full`).
   - `protocol.py`: 4-byte length prefix + JSON, 1 MiB cap.
   - `tlsserver.py`: generic TLS server with handler dispatch, used by both services.
-  - `backend.py`: `LocalBackend` and `RemoteBackend`, each exposing `ca` and `msg` sides.
+  - `backend.py`: `LocalBackend` and `RemoteBackend`, each exposing `ca` and `msg` sides. `RemoteBackend` passes the expected `server_hostname` for each service.
   - `client.py`, `cli.py`:
-    - Subcommands: `init-pki`, `ca`, `server`, `client`, and `status` (stage 2).
+    - Subcommands: `init-pki`, `ca serve`, `ca sign-server --csr <path> --out <path>`, `server init`, `server serve`, `client`, and (stage 2) `ca revoke` and `status`.
     - Global flags: `--home` (repo-relative, see layout), `--trace`, `--host`, `--port`. Client-only flags: `--mode local|remote`, `--user`.
-    - `init-pki --server-home <dir>` (repo-relative) puts the messaging server's TLS key and certificate in a separate home.
-    - `client` with an empty home imports the Root certificate from `--root-cert <path>` and asks you to confirm its fingerprint.
-    - Client menu: register, login, send, inbox, contacts/verify, show my fingerprints, logout. Live delivery runs in the background once you're logged in.
+    - `client` with an empty home imports the Root certificate from `--root-cert <path>` and asks you to confirm its fingerprint. `server init` takes `--root-cert` the same way.
+    - Client menu: register (resumes a half-finished registration), login, send, history, contacts/verify, show my fingerprints, logout. Live delivery runs in the background once you're logged in.
 
 ## Logging and observability
 | Piece | Behavior |
 |---|---|
-| **Crypto trace** (`--trace`) | Human-readable, one line per crypto step, on stderr. Each line has the message number and the algorithm plus sizes, for example `[A→B #3] ML-KEM-768.Encaps(ek_bob) → ss 32 B, c 1088 B`, `AES-256-GCM.Enc 112 B → 128 B (+16 B tag)`, `ML-DSA-65.Sign → σ 3309 B`. On receive, each pipeline step prints `✔` or `✘ <reason>` (chain, pin, signature, addressing, unwrap, decrypt). The CA traces issuance; the server traces mTLS peer checks and envelope storage (sizes only). Used for the defense and for report screenshots. |
+| **Crypto trace** (`--trace`) | Human-readable, one line per crypto step, on stderr. Each line has the message number and the algorithm plus sizes, for example `[A→B #3] ML-KEM-768.Encaps(ek_bob) → ss 32 B, c 1088 B`, `AES-256-GCM.Enc 112 B → 128 B (+16 B tag)`, `ML-DSA-65.Sign → σ 3309 B`. On receive, each pipeline step prints `✔` or `✘ <reason>` (chain, pin, signature, addressing, unwrap, commit, decrypt). The CA traces issuance, including the KEM proof of possession. The server traces mTLS peer checks and envelope storage (sizes only). Used for the defense and for report screenshots. |
 | **App logs** | Python `logging`, one JSON object per line, written to `<home>/logs/<role>.log`. Fields: `ts, level, role, event, req_id, user, msg_id, ...`. `req_id` is created by the client and sent in every request frame. Context variables carry `req_id` and `msg_id` through the code, so one message can be traced across the client, server and CA logs. |
-| **Audit events** (WARN+, `event` prefixed `audit.`) | login ok/fail; mTLS rejected (no certificate, untrusted CA, CN mismatch); certificate issued or refused; session/CN/sender mismatch; message rejected with its reason; TOFU key change; (stage 2) revoked, password changed. |
-| **Redaction** | `RedactingFilter` on every handler drops or masks fields named `password, pw, k_auth, key, sk, dk, cek, kek, ss, token, plaintext, m`. Session tokens are logged only as `H(token)[:8]`. Code logs sizes, fingerprints and IDs, never values. A test fails the build if any secret shows up in the logs (see Testing). |
-| **`ping status`** (stage 2) | Shows uptime, users, stored messages, active sessions, rejection counts by reason, and fingerprints plus expiry dates for the Root, Sub-CA and TLS certificates. Counters are in-memory per process. The server answers over mTLS, the CA over its TLS port. |
-| **Tamper-evident audit log** (stage 2, optional) | Each server audit entry stores `prev = H(previous entry)`, and every N entries the head is signed with the server's TLS ML-DSA key. `ping status --verify-audit` re-walks the chain. |
+| **Audit events** (WARN+, `event` prefixed `audit.`) | login ok/fail; mTLS rejected (no certificate, untrusted CA, CN mismatch); certificate issued or refused (including a failed KEM proof of possession and a reused KEM key); session/CN/sender mismatch; message rejected with its reason; duplicate message skipped; TOFU key change; (stage 2) revoked, password changed. |
+| **Redaction** | `RedactingFilter` on every handler drops or masks fields named `password, pw, pw_key, k_auth, key, sk, dk, cek, kek, ss, token, plaintext, m`. Session tokens are logged only as `H(token)[:8]`. Code logs sizes, fingerprints and IDs, never values. A test fails the build if any secret shows up in the logs (see Testing). |
+| **`ping status`** (stage 2) | Shows uptime, users, pending messages, active sessions, rejection counts by reason, and fingerprints plus expiry dates for the Root, Sub-CA and TLS certificates. Counters are in-memory per process. The server answers over mTLS, the CA over its TLS port. It returns only aggregate counts and public fingerprints, never usernames or per-user data, so any authenticated user may call it. In local mode it reads the shared `data/` directly and shows on-disk counts only. |
+| **Tamper-evident audit log** (stage 2, optional) | Each server audit entry stores `prev = H(previous entry)`, and every N entries (and on shutdown) the head is signed with the server's ML-DSA TLS key over `canon({"ctx":"ping/v1/audit-head", head, count})`. The context prefix keeps these signatures from ever being mistaken for TLS handshake signatures. `ping status --verify-audit` re-walks the chain. Stated limit: an attacker holding the server key can rewrite the whole log, and truncation after the last signed head isn't detected. |
 
 ## Demo setup and live delivery
 ### Live delivery (`wait_inbox`)
-- After login the client starts a background thread on its own mTLS connection. It loops on `wait_inbox(token, since=last_seen_ts)`.
+- After login the client starts a background thread on its own mTLS connection. It loops on `wait_inbox(token, since_seq=last_acked_seq)`.
 - The server keeps a `threading.Condition` per recipient. `send` stores the envelope, then calls `notify_all` for that recipient. `wait_inbox` returns new envelopes straight away, or `[]` after 25 s, and the client then re-polls.
 - Each returned envelope goes through the full open pipeline before it's shown:
-  - `[alice ✔ verified] hola bob`, or
+  - `[alice ✔ verified] hola bob`, `[alice ? unverified] hola bob`, or
   - `[REJECTED from alice: signature invalid]`.
-- Local mode (no servers): the client polls `data/server/messages/<me>/` every 1 s. This is safe across processes because each message is its own file written with `os.replace`.
+- Then the client writes history and acks.
+- Local mode (no servers): the client polls `data/server/messages/<me>/` every 1 s for sequence numbers above its last ack, and acks by deleting the file under the recipient's lock. This is safe across processes because every write uses `os.replace`, and the sequence counter is only updated under `flock`.
 
 ### Per-role homes (models separate machines, all inside `<repo>/demo/`)
 One-time setup, from the repo directory:
 ```bash
 uv sync
-uv run ping init-pki --home demo/ca --server-home demo/server
-# 4 passphrases. Root + Sub-CA + CA-TLS go to <repo>/demo/ca, server-TLS to <repo>/demo/server
+uv run ping init-pki    --home demo/ca
+# 3 passphrases: Root, Sub-CA, CA-TLS
+uv run ping server init --home demo/server --root-cert demo/ca/keys/pki/root/root_ca.crt.pem
+# server-TLS passphrase; generates the server key + CSR inside demo/server
+uv run ping ca sign-server --home demo/ca --csr demo/server/keys/tls/server.csr.pem \
+                           --out demo/server/keys/tls/server.crt.pem
+# Sub-CA passphrase
 ```
 
 **Option A: four ordinary terminal windows or tabs** (no multiplexer needed). In each one, `cd ~/coding-projects/UC3M/ping-secure-messenger` first:
 ```bash
-T1: uv run ping ca     --home demo/ca     --trace      # 127.0.0.1:7443, asks for Sub-CA + CA-TLS passphrases
-T2: uv run ping server --home demo/server --trace      # 127.0.0.1:7444, asks for server-TLS passphrase
+T1: uv run ping ca serve     --home demo/ca     --trace   # 127.0.0.1:7443, asks for Sub-CA + CA-TLS passphrases
+T2: uv run ping server serve --home demo/server --trace   # 127.0.0.1:7444, asks for server-TLS passphrase
 T3: uv run ping client --home demo/alice  --root-cert demo/ca/keys/pki/root/root_ca.crt.pem --trace
 T4: uv run ping client --home demo/bob    --root-cert demo/ca/keys/pki/root/root_ca.crt.pem --trace
 ```
 Start T1 and T2 before the clients. VS Code's split terminal works fine for this.
 
-**Option B: `scripts/demo.sh`** (needs `tmux`, `brew install tmux`). It opens a `ping-demo` session with the same four panes and commands pre-typed. `--reset` runs `rm -rf <repo>/demo` and `init-pki` first. If `tmux` isn't installed, the script prints the Option A commands and exits instead.
+**Option B: `scripts/demo.sh`** (needs `tmux`, `brew install tmux`). It opens a `ping-demo` session with the same four panes and commands pre-typed. `--reset` runs `rm -rf <repo>/demo` and the setup commands first. If `tmux` isn't installed, the script prints the Option A commands and exits instead.
 
-- Only the public Root certificate moves between homes; this models out-of-band distribution.
-- `demo/server` contains no Sub-CA key. `demo/alice` contains only Alice's keys.
+- Only public material moves between homes (the Root certificate, and the server's CSR and certificate). This models out-of-band distribution.
+- `demo/server` contains no Sub-CA or Root key, and its TLS key was generated there. `demo/alice` contains only Alice's keys.
 - Ports are overridable with `--port`. Passphrases can be supplied with `PING_<NAME>_PASSPHRASE_FILE` (mode 0600) for rehearsals. Keep those files in `<repo>/demo/` (gitignored), not elsewhere on the machine.
 
 ### Demo script (what to show)
-1. Alice and Bob register. T1 traces CSR and proof-of-possession checks and issuance.
-2. Both run `verify`. The safety numbers match on screen, and the contact is marked verified.
-3. Alice sends "hola bob":
+1. Alice and Bob register. T1 traces the CSR check, the KEM challenge (`Encaps` → `t` verified) and issuance.
+2. Alice sends "hola bob". T4 shows `[alice ? unverified] hola bob`. Both run `verify`; the safety numbers match on screen, and the contact is marked verified.
+3. Alice sends a second message:
    - T3 traces Encaps, encryption and signing.
-   - T2 logs `stored envelope 4.6 kB for bob` (no plaintext).
-   - T4 shows the message within about 1 s, with each check marked ✔.
-4. Tamper: flip one byte in `demo/server/data/server/messages/bob/<id>.json`, then refetch. T4 shows `✘ signature invalid → REJECTED`, and T2's audit log shows the event. Or run `scripts/tamper_demo.py`.
-5. MITM: restart the server with `--evil` (test-only flag; it swaps in a rogue-CA certificate for Bob). Alice's send is refused with `✘ chain: untrusted issuer`.
-6. (Stage 2) `ping status` shows rejection counters; `ping ca revoke bob` makes Bob's next mTLS handshake fail.
+   - T2 logs `stored envelope 4.6 kB for bob seq=2` (no plaintext).
+   - T4 shows the message within about 1 s, with each check marked ✔. Then T2 logs the ack and the deletion.
+   - Bob logs out and back in: his history still shows both messages, with nothing re-fetched.
+4. Tamper:
+   1. Bob logs out, and Alice sends a message.
+   2. Run `scripts/tamper_demo.py --flip demo/server/data/server/messages/bob/<seq>.json`. It decodes `body.ct`, flips one byte and re-encodes, so the JSON stays valid.
+   3. Bob logs in. T4 shows `✘ signature invalid → REJECTED`, and the audit log shows the event.
+5. MITM: stop T2 and run `uv run python scripts/evil_server.py --home demo/server` in its place. It swaps in a rogue-CA certificate when Alice looks up a new contact, carol. Alice's send is refused with `✘ chain: untrusted issuer`.
+6. (Stage 2) `ping status` shows the rejection counters. `ping ca revoke bob` makes Bob's open connection drop and his next mTLS handshake fail.
 
 ## Stage 1: core app (this pass)
-0. Copy this plan to `plan.md` at the repo root (left uncommitted) so it can be referred to during implementation and turned into the report.
-1. Config (`--home`), logging (trace, JSON logs, audit, redaction), storage, auth, keystore, pki, plus `init-pki` (`--server-home`), with the unit tests for these.
-2. CA service, messaging service, LocalBackend, CLI register/login. **Checkpoint: local mode works end to end.**
-3. Messaging, contacts (TOFU pins and safety numbers), send/inbox, local-mode live delivery (polling), with envelope, tamper and MITM tests.
+0. Run the "still to probe" items first, and adjust `pki.verify_cert` to whichever path works.
+1. Config (`--home`, `check_openssl`), logging (trace, JSON logs, audit, redaction), storage (atomic, exclusive create, flock), auth, keystore, pki (including KEM proof of possession), plus `init-pki`, `server init` and `ca sign-server`, with the unit tests for these.
+2. CA service, messaging service, LocalBackend, CLI register/login. **Checkpoint: local mode works end to end, including two client processes at once.**
+3. Messaging, contacts (TOFU pins and safety numbers), sealed history, send/inbox/ack, local-mode live delivery (polling), with envelope, tamper and MITM tests.
 4. Protocol, `tlsserver`, both TLS services, RemoteBackend, `wait_inbox` long-poll and the client listener thread, with integration and TLS tests.
-5. `scripts/demo.sh`, `--evil` test flag, plus a full four-terminal rehearsal.
+5. `scripts/demo.sh`, `scripts/evil_server.py`, plus a full four-terminal rehearsal.
 
 ## Stage 2: extras (after the stage-1 checkpoint)
 1. **Password change.** Runs over an authenticated session.
    1. Derive the old keys and open the key files (proves the old password).
-   2. Generate a new `client_salt`, derive the new keys, and re-seal the keys, `seen.json` and `contacts.json` into `*.json.new` with fresh nonces. Write `profile.json.new` with the new salt.
+   2. Generate a new `client_salt`, derive the new keys, and re-seal the keys, `history.json` and `contacts.json` into `*.json.new` with fresh nonces. Write `profile.json.new` with the new salt. Write a `pwchange.pending` marker last.
    3. Call `change_password(old_auth, new_auth)`. The server verifies and atomically replaces the record.
-   4. On success, `os.replace` the `.new` files into place. On failure, delete them.
-   5. Other sessions for that user are invalidated.
+   4. On success, `os.replace` the `.new` files into place (profile last), then delete the marker. On a clear refusal from the server, delete the `.new` files and the marker.
+   5. **Recovery at startup**, if the marker exists (a crash, or a lost reply): ask for the password.
+      - If it opens the `.new` set, try `login` with the new `auth_key`. If the server accepts, finish step 4.
+      - If it opens the old set and the server accepts the old `auth_key`, the change never happened: discard the `.new` files.
+   6. Other sessions for that user are invalidated.
 
    Certificates are unchanged.
 2. **Revocation and CRL.**
-   - Run by the CA service: `ping ca revoke <user> --reason keyCompromise` adds both serials to a CRL signed with ML-DSA-65 (`next_update` = 7 days), written to `keys/pki/sub/sub_ca.crl.pem`. The user's slot becomes free for re-issue.
+   - `init-pki` publishes an empty CRL straight away, so `VERIFY_CRL_CHECK_LEAF` never fails just because no CRL is loaded.
+   - Run by the CA service: `ping ca revoke <user> --reason keyCompromise` adds both serials to a CRL signed with ML-DSA-65, written to `keys/pki/sub/sub_ca.crl.pem`. The user's slot becomes free for re-issue. The KEM key stays in `kem_index`, so the old key can never be certified again.
+   - The running CA re-signs the CRL every 24 h with `next_update` = 7 days, so a short CA outage doesn't lock everyone out.
    - `get_crl` endpoint on the CA.
-   - **Messaging server:** fetches the CRL and loads it into its TLS context (`VERIFY_CRL_CHECK_LEAF`), rebuilding the context when the CRL changes. A revoked user can't complete mTLS.
+   - **Messaging server:** fetches the CRL, loads it into its TLS context, and rebuilds the context when the CRL changes. Rebuilding doesn't touch sockets that are already open, so on a change it also closes the connections and sessions of every revoked serial (it tracks connections by peer-certificate serial). A revoked user can't complete mTLS again.
    - **Client `verify_cert`:** checks the CRL signature against the Sub-CA, freshness, and whether the serial is listed.
    - Messages from revoked senders are rejected, because the sender sets the timestamp and it can't be trusted.
    - A re-issued contact shows as a pin change, so the user verifies the safety number again.
-   - Probe first that ML-DSA CRLs work in both `cryptography` and the `ssl` module's OpenSSL.
-3. **Tamper and MITM demo**, `scripts/tamper_demo.py`. Uses a temporary `PING_HOME` and passphrase files, registers alice and bob, and sends a real message. It then runs every attack in the test catalogue below and prints `ATTACK → REJECTED: <reason>` for the report screenshots. It shares its scenario helpers with the tests.
+3. **Tamper and MITM demo**, `scripts/tamper_demo.py`. Uses a temporary `PING_HOME` and passphrase files, registers alice and bob, and sends a real message. It then runs every attack in the test catalogue below and prints `ATTACK → REJECTED: <reason>` for the report screenshots. It shares its scenario helpers with the tests. `--flip <file>` is the single-file mode used in the live demo.
 4. **`ping status`** with in-memory counters, and certificate fingerprints and expiry dates.
 5. **Tamper-evident audit log** (optional): hash-chained entries plus signed heads, and `status --verify-audit`.
+
+## Known limitations (for the report)
+- **Login is one factor in practice:** the key file and the server check both come down to the same password (see Flow 2).
+- **No identity proofing:** the CA is first come, first served, and anyone (including the messaging server) can squat a name.
+- **Username enumeration** is possible through the CA and `get_certs`.
+- **First contact** relies on the CA until the safety numbers are compared.
+- **State rollback** of `history.json` or `contacts.json` to an older sealed copy is not detected.
+- **No forward secrecy.** Readers use a static ML-KEM key, so an attacker who recorded envelopes and later steals `dk_B` (key file plus password) can read them. A ratchet is out of scope.
+- **Metadata** (who, whom, when, size) is visible to the server, which can also drop or delay messages.
+- **No revocation in stage 1:** a stolen key can't be revoked until stage 2.
+- **Local mode is single-operator:** the separation between the CA and the server only holds in remote mode.
+- **Memory:** Python can't reliably wipe secrets.
+- **Root key placement:** in the demo the Root key sits on the CA machine, under its own passphrase, and is never loaded by a running service.
+- **Audit log:** whoever holds the server key can rewrite it, and truncation after the last signed head isn't detected.
 
 ## Testing strategy
 - **Tools:** `pytest` (dev dependency). Run with `uv run pytest`.
@@ -475,44 +567,54 @@ Start T1 and T2 before the clients. VS Code's split terminal works fine for this
   - a fixed clock via `config.now`
   - a `users(alice, bob, mallory)` factory
   - a `rogue_ca` fixture: a separate root and sub-CA
-  - a `malicious_server` fixture: a messaging service subclass that substitutes certificates and envelopes
+  - a `malicious_server` fixture: a messaging service subclass that substitutes certificates and envelopes (the same class `scripts/evil_server.py` runs)
 - **Layers:**
   - Unit tests.
   - Integration tests parametrized over `["local", "remote"]`, with the same test bodies in both modes.
   - The remote tests start the real TLS services on `127.0.0.1:0` in threads.
 
 ### Unit tests
-- `test_auth.py`: hash then verify; wrong password fails; fresh salts; parameters stored with the hash; client derivation is deterministic and the three derived keys are all different; an unknown user and a wrong password take similar time (dummy verify).
+- `test_auth.py`: HMAC then verify; wrong password fails; fresh server salts; client derivation is deterministic and the three derived keys are all different; a password under 12 characters is refused.
 - `test_keystore.py`:
   - Round trip for ML-DSA and ML-KEM keys.
   - A wrong passphrase raises `InvalidTag`.
-  - Mutating any one of ct, nonce, owner, role, pub_fp or kdf fails; swapping the sign and KEM files fails.
+  - Mutating any one of ct, nonce, owner, role, pub_fp or kdf fails; swapping the sign and KEM files fails; swapping `history.json` and `contacts.json` fails.
   - Fresh nonce on every re-seal; mode 0600.
   - `assert_pair` rejects a mismatched key.
-  - `ssl_load_key` leaves its temporary directory empty.
+  - `ssl_load_key` leaves `<home>/run` empty.
   - The passphrase file is refused if its mode isn't 0600.
-  - Tampered `seen.json` or `contacts.json` is rejected.
+  - A tampered `history.json` or `contacts.json` is rejected; a deleted one, with the key files still present, is refused at startup.
 - `test_pki.py`:
-  - The chain verifies.
+  - The chain verifies, for both the signing and the KEM certificate.
   - Rejected:
     - rogue root
     - expired or not yet valid
-    - wrong purpose (KEM cert used for signing, server cert used as a user cert)
+    - wrong purpose (KEM cert used for signing, server cert used as a user cert, CA-service cert presented as the messaging server)
     - CA certificate used as a leaf
     - path length violated
-  - The CA ignores the CN and extensions requested in the CSR.
-  - Rejected at issuance: a CSR with a bad signature, a bad KEM proof of possession, a second issue for an active username.
-- `test_contacts.py`: first use pins the contact; the same keys are accepted; changed keys raise `KeyChanged`; the safety number is the same from both sides and changes when any key changes; a verified flag survives a reload.
+  - The CA ignores the extensions requested in the CSR, and refuses a CSR whose CN differs from the username field.
+  - Rejected at issuance:
+    - a CSR with a bad signature
+    - a bad KEM binding signature
+    - a wrong or late `issue_finish` MAC
+    - a reused `rid`
+    - a KEM key already certified for another user
+    - a second issue for an active username
+  - Two concurrent `issue_finish` calls for the same name (threads, and two processes over one home): exactly one succeeds.
+- `test_contacts.py`: first use pins the contact as unverified; the same keys are accepted; changed keys raise `KeyChanged`; the safety number is the same from both sides and changes when any key changes; a verified flag survives a reload.
 - `test_messaging.py`:
-  - Round trip works; the sender can read their own copy.
+  - Round trip works; the sender can open their own copy, and the sent message is in their sealed history.
   - Each case raises `MessageRejected` with the expected reason:
-    - a mutation of header, ct, nonce, kem_ct, wrapped_cek or sig
+    - a mutation of header, ct, nonce, kem_ct, wrapped_cek, cek_commit or sig
+    - non-canonical base64url, a duplicate JSON key, an unknown field, an extra or missing wrap
     - re-addressed to another recipient
-    - a replayed `msg_id`
     - a wrong recipient key
     - signed by a valid certificate that isn't the sender's
+    - a malicious sender wrapping a different CEK for each reader (commit mismatch for one of them)
+  - A replayed `msg_id` is skipped as a duplicate, not shown twice.
+  - Sending to yourself is refused.
   - `canon` is stable regardless of key order.
-- `test_storage.py`: path-traversal usernames rejected; atomic writes.
+- `test_storage.py`: path-traversal usernames rejected; atomic writes; `create_exclusive` fails if the file exists; `locked` serializes two processes.
 - `test_log.py`:
   - `RedactingFilter` masks every listed field name, including inside nested dicts.
   - A token is logged only as an 8-character hash prefix.
@@ -522,55 +624,65 @@ Start T1 and T2 before the clients. VS Code's split terminal works fine for this
   - `--home demo/x` resolves to `<repo>/demo/x`.
   - Refused: `/tmp/x`, `~/x`, `../x`, and a symlink inside the repo pointing outside it, for both `--home` and `PING_HOME`.
   - `allow_external=True` works from the API only.
-  - `init-pki --server-home` puts no Sub-CA or Root key in the server home.
+  - After `server init` and `ca sign-server`, the server home holds no Sub-CA or Root key, and the CA home holds no server private key.
+  - `check_openssl` fails when either reported version is below 3.5 (monkeypatched).
 
 ### Integration tests (both modes)
 - `test_accounts.py`:
   - Register via CA then the server; login and logout; session expiry.
-  - Rejected: duplicate username at the CA; registering on the server with a certificate whose CN doesn't match.
+  - Rejected: duplicate username at the CA; registering on the server with a certificate whose CN doesn't match; registering with a signing certificate that isn't the TLS peer certificate (remote); registering an account that already exists.
   - A wrong password gives a generic error.
+  - Registration interrupted after issuance can be resumed.
+  - Local mode: a client that only logs in never asks for the Sub-CA passphrase.
 - `test_e2e.py`:
-  - alice sends to bob and bob reads it; mallory can't read bob's inbox; the safety numbers match across clients
+  - alice sends to bob and bob reads it; after a logout and login, bob's history still shows it and nothing is re-delivered as REJECTED; mallory can't read bob's inbox; the safety numbers match across clients.
+  - The server assigns sequence numbers: two envelopes with the same `msg_id` don't overwrite each other, and a backdated `ts` is still delivered.
+  - `ack` deletes. An unacked envelope is redelivered, and is skipped as a duplicate after a client crash between the history write and the ack.
   - Live delivery: bob's `wait_inbox` returns within 1 s of alice's send, and returns `[]` on timeout. Polling in local mode picks the message up.
-  - A rejected envelope is shown as REJECTED, not dropped silently.
+  - A rejected envelope is shown as REJECTED once: not dropped silently, and not re-fetched.
+  - The 501st pending envelope for one recipient gets `inbox_full`.
   - **No secrets in logs:** after a full register, login and send in both modes, grep every `logs/*.log` for the password, the `K_auth` hex, the token, the plaintext and the CEK. Zero hits expected.
-  - Audit events exist for login fail, mTLS reject and message reject.
+  - Audit events exist for login fail, mTLS reject, message reject and duplicate skip.
 - `test_mitm.py` (`malicious_server` and `rogue_ca`):
   - A substituted bob KEM certificate from a rogue CA → the send is refused (chain).
   - A substituted certificate that is validly issued but different (simulated compromised CA) → `KeyChanged` (pin).
   - A server-forged envelope signed with mallory's key under alice's name → rejected.
   - A server that re-addresses alice→bob mail into carol's inbox → rejected (addressing and signature).
-  - The messaging service process or object never holds the Sub-CA key (assert the attribute is absent and no `keys/pki/sub/` path is opened).
+  - A server that replays an already-read envelope → skipped as a duplicate.
+  - The messaging service object never holds the Sub-CA key (assert the attribute is absent and no `keys/pki/sub/` path is opened). In remote mode, the messaging server process doesn't either.
 - `test_tls.py` (remote only):
   - Rejected:
     - a handshake below TLS 1.3
     - a server certificate that doesn't chain to the root
+    - the CA-service certificate presented on the messaging port (hostname mismatch)
     - the messaging server without a client certificate
     - bob's certificate with alice's session
     - a client certificate from a rogue CA
-  - The CA's `issue` works without a client certificate.
+  - The CA's `issue_begin` and `issue_finish` work without a client certificate.
   - Protocol: an oversized frame is dropped; malformed JSON gets an error response, not a crash.
 
 ### Stage 2 tests
 - Password change:
   - the new password works and the old one fails
   - the keys and the sealed state still open
-  - a server failure leaves the old files intact
+  - a server refusal leaves the old files intact
+  - a crash after the server accepted but before the local swap is recovered on the next start
   - other sessions are killed
 - CRL:
-  - a revoked user fails mTLS and client-side checks
+  - the initial empty CRL lets everyone connect
+  - a revoked user fails mTLS and client-side checks, and their open connection is closed
   - a bad-signature or stale CRL is rejected
-  - a re-issued user shows as a pin change
+  - a re-issued user shows as a pin change; their old KEM key can't be re-certified
   - other users are unaffected
 - `tamper_demo.py` runs without prompts and exits 0 only if every attack is rejected.
-- `status`: counters increase on rejections; fingerprints match the certificates on disk. Audit chain: editing one entry → `--verify-audit` fails.
+- `status`: counters increase on rejections; fingerprints match the certificates on disk; the output holds no usernames. Audit chain: editing one entry → `--verify-audit` fails.
 
 ## Verification (manual, for the report)
-- `uv run ping init-pki` → `openssl x509 -text -noout -in ...` shows ML-DSA OIDs, BasicConstraints, KeyUsage and EKU for every certificate.
+- `uv run ping init-pki` → `openssl x509 -text -noout -in ...` shows ML-DSA OIDs, BasicConstraints, KeyUsage, EKU and SANs for every certificate.
 - Full demo rehearsal, done both ways: Option A (four ordinary terminals) and Option B (`scripts/demo.sh --reset`). Check that:
-  - Bob sees Alice's message live.
-  - The tamper and `--evil` steps are rejected.
+  - Bob sees Alice's message live, and still sees it in his history after logging in again.
+  - The tamper and `evil_server.py` steps are rejected.
   - `demo/*/logs/*.log` contain audit events but no secrets.
-  - Nothing is created outside `<repo>`: `git status --ignored` shows only `demo/`, and `~` is untouched.
-- `openssl s_client -connect 127.0.0.1:PORT -CAfile keys/pki/root/root_ca.crt.pem -groups X25519MLKEM768` handshake succeeds on both services. This confirms the hybrid post-quantum key exchange.
+  - Nothing is created outside `<repo>`: `git status --ignored` shows only `demo/`, `~` is untouched, and the system temp directory gets no `ping` files.
+- `openssl s_client -connect 127.0.0.1:7444 -CAfile demo/ca/keys/pki/root/root_ca.crt.pem -servername msg.ping.internal -verify_hostname msg.ping.internal -groups X25519MLKEM768` handshake succeeds, and the same for `ca.ping.internal` on 7443. This confirms the hybrid post-quantum key exchange and the separate service identities.
 - `uv run pytest` green; `uv run python scripts/tamper_demo.py` output used for the report.
