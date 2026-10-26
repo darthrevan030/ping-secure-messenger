@@ -56,8 +56,8 @@ Already done: `uv add cryptography`. Nothing will be committed (global rule).
    └──────────────────────────┘
 ```
 - **Two services, two processes, two data directories:**
-  - `ca_service.py`, run as `ping ca`, data in `var/ca/`.
-  - `service.py` (messaging), run as `ping server`, data in `var/server/`.
+  - `ca_service.py`, run as `ping ca`. Sub-CA key in `keys/pki/sub/`, issuance records in `data/ca/`.
+  - `service.py` (messaging), run as `ping server`, data in `data/server/`.
   - Both run on a generic `tlsserver.py` (ssl + ThreadingTCPServer + `protocol.py` framing). Each has its own TLS certificate from the Sub-CA (SAN `localhost`, different ports and CNs: `ping-ca` and `ping-server`).
 - **Backends:**
   - `LocalBackend` holds a `CAService` and a `MessagingService` as separate objects. Only the CA object ever holds the Sub-CA key.
@@ -209,7 +209,7 @@ sequenceDiagram
 3. **The CA checks the request:**
    - the CSR signature is valid and the proof-of-possession signature verifies under the CSR's key
    - the username is valid and has **no active certificate** (one active pair per username). Re-issuing needs revocation first (stage 2).
-4. **The CA builds both certificates itself.** It ignores the requested extensions, sets the subject, SAN `ping:user:<name>`, KeyUsage and EKU, then signs. It writes an issuance record to `var/ca/issued/<user>.json` and returns the certificates plus the chain.
+4. **The CA builds both certificates itself.** It ignores the requested extensions, sets the subject, SAN `ping:user:<name>`, KeyUsage and EKU, then signs. It writes an issuance record to `data/ca/issued/<user>.json` and returns the certificates plus the chain.
 5. **The client verifies the certificates:** chain to the pinned root, CN = username, and the public keys equal its own. It then seals and saves the keys.
 6. **Client → server `register`** over mTLS, presenting the new signing certificate. It sends:
    - the username
@@ -227,7 +227,7 @@ Who could attempt a MITM, and why it fails:
 | **Malicious messaging server** | Hand Alice a fake "bob" KEM certificate so it can decrypt | It has no CA key, so it can't create a certificate that chains to the Root. Clients verify every certificate they receive. |
 | Malicious messaging server | Serve an old revoked Bob certificate | Clients check the CA's CRL (stage 2), and the CA allows one active pair per name |
 | Malicious messaging server | Register as "bob" before Bob does | That's squatting, not a MITM. The CA refuses the real Bob's registration, so it's visible. Prevented properly only by identity proofing, which is out of scope. |
-| **Compromised CA service** | Issue a second valid "bob" pair | **Key pinning (trust on first use, TOFU):** the client pins each contact's certificate fingerprints on first contact in `clients/<me>/contacts.json` (sealed). Any change → hard stop: "bob's keys changed – verify". **Safety numbers:** `verify <contact>` shows `SHA-256(sorted(my sign+kem fps ‖ their fps))` as 12 groups of 5 digits. The two users compare them in person and mark the contact verified. A key change on a verified contact is never accepted silently. |
+| **Compromised CA service** | Issue a second valid "bob" pair | **Key pinning (trust on first use, TOFU):** the client pins each contact's certificate fingerprints on first contact in `data/clients/<me>/contacts.json` (sealed). Any change → hard stop: "bob's keys changed – verify". **Safety numbers:** `verify <contact>` shows `SHA-256(sorted(my sign+kem fps ‖ their fps))` as 12 groups of 5 digits. The two users compare them in person and mark the contact verified. A key change on a verified contact is never accepted silently. |
 | Root CA compromise | Anything | Same pinning and safety numbers. Out of scope beyond that; the key is offline. |
 
 What stays possible: the server can see metadata and can drop or delay messages. It can't read, modify, forge or MITM them.
@@ -281,11 +281,11 @@ Every private key file (Root CA, Sub-CA, two TLS keys, user sign and KEM) is a J
 
 ### Trust anchor
 - `init-pki` prints the Root certificate's SHA-256 fingerprint.
-- The client stores `root_ca.crt.pem` plus the pinned fingerprint in `clients/trust.json`. The user confirms it on first run; after that a mismatch is a hard failure.
+- The client reads `keys/pki/root/root_ca.crt.pem` and stores its pinned fingerprint in `data/clients/trust.json`. The user confirms it on first run; after that a mismatch is a hard failure.
 - The root is the only anchor in `ssl` (`load_verify_locations`) and in `x509.verification.Store`. System CAs are never loaded.
 
 ### User passwords
-1. `client_salt` is generated at sign-up and kept in `clients/<user>/profile.json`. It's public, and the server never needs it. Keeping it local breaks the cycle where login needs mTLS, mTLS needs the signing key, and the signing key needs the salt. It also removes any username-probing endpoint.
+1. `client_salt` is generated at sign-up and kept in `data/clients/<user>/profile.json`. It's public, and the server never needs it. Keeping it local breaks the cycle where login needs mTLS, mTLS needs the signing key, and the signing key needs the salt. It also removes any username-probing endpoint.
 2. `master = Scrypt(password, client_salt, n=2^17, r=8, p=1)`.
 3. Derive three keys from `master` with HKDF:
    - `auth_key` (`info="ping/auth"`): sent to the server over mTLS.
@@ -330,7 +330,25 @@ When the messaging server accepts an upload, it also checks that the mTLS CN, th
 ## Files (new unless noted)
 - `pyproject.toml` (modify): `[project.scripts] ping = "ping.cli:main"`, uv_build backend, description, pytest dev dependency.
 - `main.py` (modify): shim calling `ping.cli.main`.
-- `.gitignore`: `.venv/`, `__pycache__/`, `var/`.
+- `.gitignore` : `.venv/`, `__pycache__/`, `.pytest_cache/`, `keys/`, `data/`, `.DS_Store`.
+
+## Runtime directory layout (all gitignored, root = `PING_HOME`, default the repo root)
+```text
+keys/                              # ALL key material and certificates
+  pki/root/   root_ca.key.json  root_ca.crt.pem          # Root key: only used by init-pki
+  pki/sub/    sub_ca.key.json   sub_ca.crt.pem  sub_ca.crl.pem
+  pki/tls/    ca.key.json  ca.crt.pem  server.key.json  server.crt.pem
+  users/<u>/  sign.key.json  kem.key.json  sign.crt.pem  kem.crt.pem
+data/                              # app state, no private keys
+  ca/issued/<u>.json               # CA issuance records
+  server/users/<u>.json            # Scrypt(K_auth) + certs
+  server/messages/<recipient>/<id>.json   # E2E envelopes
+  clients/trust.json               # pinned Root fingerprint
+  clients/<u>/  profile.json  seen.json  contacts.json   # last two sealed
+```
+- `*.key.json` files are keystore containers (AES-256-GCM), mode 0600. Directories under `keys/` are mode 0700.
+- `ping init-pki` refuses to overwrite an existing `keys/pki/`. To reset: `rm -rf keys data`.
+- Tests and the tamper demo set `PING_HOME` to a temporary directory, so they never touch the repo's `keys/` or `data/`. One-off probes and scratch scripts write only to the session scratchpad, never the repo.
 - **`src/ping/` core:**
   - `config.py`: paths, `get_passphrase`, `now()` clock that tests can override, `KdfParams`.
   - `log.py`: `crypto_log(op, alg, detail)` (report screenshots).
@@ -366,7 +384,7 @@ When the messaging server accepts an upload, it also checks that the mTLS CN, th
 
    Certificates are unchanged.
 2. **Revocation and CRL.**
-   - Run by the CA service: `ping ca revoke <user> --reason keyCompromise` adds both serials to a CRL signed with ML-DSA-65 (`next_update` = 7 days), written to `var/ca/sub_ca.crl.pem`. The user's slot becomes free for re-issue.
+   - Run by the CA service: `ping ca revoke <user> --reason keyCompromise` adds both serials to a CRL signed with ML-DSA-65 (`next_update` = 7 days), written to `keys/pki/sub/sub_ca.crl.pem`. The user's slot becomes free for re-issue.
    - `get_crl` endpoint on the CA.
    - **Messaging server:** fetches the CRL and loads it into its TLS context (`VERIFY_CRL_CHECK_LEAF`), rebuilding the context when the CRL changes. A revoked user can't complete mTLS.
    - **Client `verify_cert`:** checks the CRL signature against the Sub-CA, freshness, and whether the serial is listed.
@@ -434,7 +452,7 @@ When the messaging server accepts an upload, it also checks that the mTLS CN, th
   - A substituted certificate that is validly issued but different (simulated compromised CA) → `KeyChanged` (pin).
   - A server-forged envelope signed with mallory's key under alice's name → rejected.
   - A server that re-addresses alice→bob mail into carol's inbox → rejected (addressing and signature).
-  - The messaging service process or object never holds the Sub-CA key (assert the attribute is absent and no `var/ca/` path is opened).
+  - The messaging service process or object never holds the Sub-CA key (assert the attribute is absent and no `keys/pki/sub/` path is opened).
 - `test_tls.py` (remote only):
   - Rejected:
     - a handshake below TLS 1.3
@@ -461,5 +479,5 @@ When the messaging server accepts an upload, it also checks that the mTLS CN, th
 ## Verification (manual, for the report)
 - `uv run ping init-pki` → `openssl x509 -text -noout -in ...` shows ML-DSA OIDs, BasicConstraints, KeyUsage and EKU for every certificate.
 - Four terminals: `uv run ping ca`, `uv run ping server`, then two `uv run ping client` → register, compare safety numbers, send, read.
-- `openssl s_client -connect 127.0.0.1:PORT -CAfile var/pki/root/root_ca.crt.pem -groups X25519MLKEM768` handshake succeeds on both services. This confirms the hybrid post-quantum key exchange.
+- `openssl s_client -connect 127.0.0.1:PORT -CAfile keys/pki/root/root_ca.crt.pem -groups X25519MLKEM768` handshake succeeds on both services. This confirms the hybrid post-quantum key exchange.
 - `uv run pytest` green; `uv run python scripts/tamper_demo.py` output used for the report.
