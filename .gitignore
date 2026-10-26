@@ -8,6 +8,7 @@ __pycache__/
 keys/
 data/
 logs/
+run/
 demo/
 
 # OS / editor
