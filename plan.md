@@ -128,8 +128,8 @@ sequenceDiagram
   participant CA as CA service
   participant S as Messaging server
   Note over A: salt_A ←$ {0,1}^128 (public, profile.json)
-  Note over A: master = Scrypt(pw, salt_A)
-  Note over A: K_auth, K_file, K_state = KDF(master, "auth" / "keyfile" / "state")
+  Note over A: pw_key = Scrypt(pw, salt_A) (memory only, discarded after use)
+  Note over A: K_auth, K_file, K_state = KDF(pw_key, "auth" / "keyfile" / "state")
   Note over A: (sk_A, pk_A) ← ML-DSA.KeyGen(), (dk_A, ek_A) ← ML-KEM.KeyGen()
   Note over A: csr = Sig_sk_A(alice ‖ pk_A), pop = Sig_sk_A("kem-pop" ‖ alice ‖ H(ek_A))
   A->>CA: TLS[ issue(csr, ek_A, pop) ]
@@ -152,7 +152,7 @@ sequenceDiagram
   participant A as Alice (client)
   participant S as Messaging server
   Note over A: salt_A read from local profile.json (no network)
-  Note over A: master = Scrypt(pw, salt_A), then KDF gives K_auth, K_file, K_state
+  Note over A: pw_key = Scrypt(pw, salt_A), then KDF gives K_auth, K_file, K_state
   Note over A: sk_A = ADec_K_file(N, c_sk, AD=meta), dk_A likewise
   Note over A: ADec fails = wrong password or tampered file, abort
   Note over A: sk_A loaded into ssl via one-time-password temp file (deleted at once)
@@ -241,7 +241,7 @@ Every private key file (Root CA, Sub-CA, two TLS keys, user sign and KEM) is a J
 ```
 - **Wrapping key (KEK):**
   - CA and server keys: `Scrypt(passphrase, salt)`, with the parameters stored in the file.
-  - User keys: `keyfile_key = HKDF(master, info="ping/keyfile")`.
+  - User keys: `keyfile_key = HKDF(pw_key, info="ping/keyfile")`.
 - **Encryption:** `ct = AESGCM(kek).encrypt(urandom(12), pkcs8_der, aad=canon({v, alg, kdf, owner, role, pub_fp}))`.
   - Swapping files, changing the owner or role, or editing the KDF parameters (a downgrade) all break the tag.
 - **Opening:**
@@ -255,7 +255,7 @@ Every private key file (Root CA, Sub-CA, two TLS keys, user sign and KEM) is a J
   3. `load_cert_chain(cert, tmp, password=otp)` is called, and the file is deleted in a `finally` block.
 
   The disk never holds the key unencrypted, and the temporary copy's password never touches disk.
-- **Sealed client state:** the replay cache (`seen.json`) and the contact pins (`contacts.json`) use the same container with `HKDF(master, "ping/state")`. Editing or deleting them is detected.
+- **Sealed client state:** the replay cache (`seen.json`) and the contact pins (`contacts.json`) use the same container with `HKDF(pw_key, "ping/state")`. Editing or deleting them is detected.
 
 ## Secrets: validation and how they get loaded
 ### CA and server passphrases
@@ -286,12 +286,14 @@ Every private key file (Root CA, Sub-CA, two TLS keys, user sign and KEM) is a J
 
 ### User passwords
 1. `client_salt` is generated at sign-up and kept in `data/clients/<user>/profile.json`. It's public, and the server never needs it. Keeping it local breaks the cycle where login needs mTLS, mTLS needs the signing key, and the signing key needs the salt. It also removes any username-probing endpoint.
-2. `master = Scrypt(password, client_salt, n=2^17, r=8, p=1)`.
-3. Derive three keys from `master` with HKDF:
+2. `pw_key = Scrypt(password, client_salt, n=2^17, r=8, p=1)`. This is the password-derived key: **never stored, never sent**. It's recomputed at each sign-up or login and dropped once the three keys below are derived. The keys that stay local (`keyfile_key`, `state_key`) are kept in memory only for the session.
+3. Derive three independent keys from `pw_key` with HKDF. One expensive Scrypt, then cheap domain-separated splits. Because HKDF is one-way, leaking one key reveals nothing about the others.
    - `auth_key` (`info="ping/auth"`): sent to the server over mTLS.
    - `keyfile_key` (`info="ping/keyfile"`): stays local.
    - `state_key` (`info="ping/state"`): stays local.
 4. The server stores `Scrypt(auth_key, server_salt)` together with its parameters. It checks with `Scrypt.verify` (constant time), and does a dummy verify for unknown users. The server never sees anything that decrypts the key files.
+5. **Why split the password's job at all:** the password has to unlock the local private keys and also authenticate to the server. Splitting it means the server, or anyone who steals `auth_key` from it, can at most log in. They can't decrypt the key files or read messages, and the plain password never leaves the client (which also protects users who reuse passwords).
+6. **Known limitation (report and defense):** `auth_key` is enough to log in, just as the password would be. It's protected by TLS in transit and by Scrypt at rest on the server. A PAKE protocol (for example OPAQUE) would remove that, and is noted as future work.
 
 ## How the envelope is protected
 Wire and disk format: JSON, binary fields base64url.
