@@ -330,7 +330,8 @@ When the messaging server accepts an upload, it also checks that the mTLS CN, th
 ## Files (new unless noted)
 - `pyproject.toml` (modify): `[project.scripts] ping = "ping.cli:main"`, uv_build backend, description, pytest dev dependency.
 - `main.py` (modify): shim calling `ping.cli.main`.
-- `.gitignore` : `.venv/`, `__pycache__/`, `.pytest_cache/`, `keys/`, `data/`, `.DS_Store`.
+- `.gitignore` : `.venv/`, `__pycache__/`, `.pytest_cache/`, `keys/`, `data/`, `logs/`, `demo/`, `.DS_Store`.
+- `scripts/demo.sh`: optional tmux launcher for the four-pane demo. Without tmux it prints the plain four-terminal commands (see "Demo setup").
 
 ## Runtime directory layout (all gitignored, root = `PING_HOME`, default the repo root)
 ```text
@@ -345,13 +346,22 @@ data/                              # app state, no private keys
   server/messages/<recipient>/<id>.json   # E2E envelopes
   clients/trust.json               # pinned Root fingerprint
   clients/<u>/  profile.json  seen.json  contacts.json   # last two sealed
+logs/                              # JSON-lines app + audit logs (redacted)
+  ca.log  server.log  client-<u>.log
 ```
+- **`--home` is always inside the repo** (never the machine's `~`):
+  - `config.resolve_home(arg)` takes the repo root: the directory containing `pyproject.toml`, found by walking up from `ping/__file__`.
+  - A relative `arg` resolves to `<repo>/<arg>`. The default is `<repo>` itself.
+  - After `Path.resolve()` (which follows symlinks), the result must still be under `<repo>`. If not, it's refused with `--home must be inside the project directory`. That covers absolute paths, `~…`, and `../` escapes.
+  - The `PING_HOME` env var follows the same rule.
+  - The only exception is the Python API `resolve_home(path, allow_external=True)`, used by the pytest fixtures so tests can run in `tmp_path`. The CLI never passes it.
+- Each role only creates the parts of this layout it needs.
 - `*.key.json` files are keystore containers (AES-256-GCM), mode 0600. Directories under `keys/` are mode 0700.
 - `ping init-pki` refuses to overwrite an existing `keys/pki/`. To reset: `rm -rf keys data`.
 - Tests and the tamper demo set `PING_HOME` to a temporary directory, so they never touch the repo's `keys/` or `data/`. One-off probes and scratch scripts write only to the session scratchpad, never the repo.
 - **`src/ping/` core:**
   - `config.py`: paths, `get_passphrase`, `now()` clock that tests can override, `KdfParams`.
-  - `log.py`: `crypto_log(op, alg, detail)` (report screenshots).
+  - `log.py`: `setup_logging(role, home, trace)`, `trace(step, **sizes)` (crypto trace), `audit(event, **fields)`, `RedactingFilter`, `req_id`/`msg_id` context variables (see "Logging and observability").
   - `storage.py`: atomic JSON store, username regex `^[a-z0-9_]{3,32}$`.
   - `auth.py`: client-side derivation, server-side hash and verify.
   - `keystore.py`: `seal_key`, `open_key`, `assert_pair`, `ssl_load_key`, `seal_state`, `open_state`.
@@ -361,18 +371,77 @@ data/                              # app state, no private keys
   - `messaging.py`: `canon`, `seal`, `open_envelope`, `MessageRejected(reason)`.
 - **`src/ping/` services and transport:**
   - `ca_service.py`: `issue`, `get_certs`, the issuance store, and (stage 2) revoke and CRL.
-  - `service.py`: messaging — register, login, logout, get_certs, send, inbox.
+  - `service.py`: messaging — register, login, logout, get_certs, send, inbox, `wait_inbox(token, since, timeout≤25 s)` (long-poll), `status` (stage 2).
   - `protocol.py`: 4-byte length prefix + JSON, 1 MiB cap.
   - `tlsserver.py`: generic TLS server with handler dispatch, used by both services.
   - `backend.py`: `LocalBackend` and `RemoteBackend`, each exposing `ca` and `msg` sides.
-  - `client.py`, `cli.py`: subcommands `init-pki`, `ca`, `server`, `client --mode`. Client menu: register, login, send, inbox, contacts/verify, show my fingerprints, logout.
+  - `client.py`, `cli.py`:
+    - Subcommands: `init-pki`, `ca`, `server`, `client`, and `status` (stage 2).
+    - Global flags: `--home` (repo-relative, see layout), `--trace`, `--host`, `--port`. Client-only flags: `--mode local|remote`, `--user`.
+    - `init-pki --server-home <dir>` (repo-relative) puts the messaging server's TLS key and certificate in a separate home.
+    - `client` with an empty home imports the Root certificate from `--root-cert <path>` and asks you to confirm its fingerprint.
+    - Client menu: register, login, send, inbox, contacts/verify, show my fingerprints, logout. Live delivery runs in the background once you're logged in.
+
+## Logging and observability
+| Piece | Behavior |
+|---|---|
+| **Crypto trace** (`--trace`) | Human-readable, one line per crypto step, on stderr. Each line has the message number and the algorithm plus sizes, for example `[A→B #3] ML-KEM-768.Encaps(ek_bob) → ss 32 B, c 1088 B`, `AES-256-GCM.Enc 112 B → 128 B (+16 B tag)`, `ML-DSA-65.Sign → σ 3309 B`. On receive, each pipeline step prints `✔` or `✘ <reason>` (chain, pin, signature, addressing, unwrap, decrypt). The CA traces issuance; the server traces mTLS peer checks and envelope storage (sizes only). Used for the defense and for report screenshots. |
+| **App logs** | Python `logging`, one JSON object per line, written to `<home>/logs/<role>.log`. Fields: `ts, level, role, event, req_id, user, msg_id, ...`. `req_id` is created by the client and sent in every request frame. Context variables carry `req_id` and `msg_id` through the code, so one message can be traced across the client, server and CA logs. |
+| **Audit events** (WARN+, `event` prefixed `audit.`) | login ok/fail; mTLS rejected (no certificate, untrusted CA, CN mismatch); certificate issued or refused; session/CN/sender mismatch; message rejected with its reason; TOFU key change; (stage 2) revoked, password changed. |
+| **Redaction** | `RedactingFilter` on every handler drops or masks fields named `password, pw, k_auth, key, sk, dk, cek, kek, ss, token, plaintext, m`. Session tokens are logged only as `H(token)[:8]`. Code logs sizes, fingerprints and IDs, never values. A test fails the build if any secret shows up in the logs (see Testing). |
+| **`ping status`** (stage 2) | Shows uptime, users, stored messages, active sessions, rejection counts by reason, and fingerprints plus expiry dates for the Root, Sub-CA and TLS certificates. Counters are in-memory per process. The server answers over mTLS, the CA over its TLS port. |
+| **Tamper-evident audit log** (stage 2, optional) | Each server audit entry stores `prev = H(previous entry)`, and every N entries the head is signed with the server's TLS ML-DSA key. `ping status --verify-audit` re-walks the chain. |
+
+## Demo setup and live delivery
+### Live delivery (`wait_inbox`)
+- After login the client starts a background thread on its own mTLS connection. It loops on `wait_inbox(token, since=last_seen_ts)`.
+- The server keeps a `threading.Condition` per recipient. `send` stores the envelope, then calls `notify_all` for that recipient. `wait_inbox` returns new envelopes straight away, or `[]` after 25 s, and the client then re-polls.
+- Each returned envelope goes through the full open pipeline before it's shown:
+  - `[alice ✔ verified] hola bob`, or
+  - `[REJECTED from alice: signature invalid]`.
+- Local mode (no servers): the client polls `data/server/messages/<me>/` every 1 s. This is safe across processes because each message is its own file written with `os.replace`.
+
+### Per-role homes (models separate machines, all inside `<repo>/demo/`)
+One-time setup, from the repo directory:
+```bash
+uv sync
+uv run ping init-pki --home demo/ca --server-home demo/server
+# 4 passphrases. Root + Sub-CA + CA-TLS go to <repo>/demo/ca, server-TLS to <repo>/demo/server
+```
+
+**Option A: four ordinary terminal windows or tabs** (no multiplexer needed). In each one, `cd ~/coding-projects/UC3M/ping-secure-messenger` first:
+```bash
+T1: uv run ping ca     --home demo/ca     --trace      # 127.0.0.1:7443, asks for Sub-CA + CA-TLS passphrases
+T2: uv run ping server --home demo/server --trace      # 127.0.0.1:7444, asks for server-TLS passphrase
+T3: uv run ping client --home demo/alice  --root-cert demo/ca/keys/pki/root/root_ca.crt.pem --trace
+T4: uv run ping client --home demo/bob    --root-cert demo/ca/keys/pki/root/root_ca.crt.pem --trace
+```
+Start T1 and T2 before the clients. VS Code's split terminal works fine for this.
+
+**Option B: `scripts/demo.sh`** (needs `tmux`, `brew install tmux`). It opens a `ping-demo` session with the same four panes and commands pre-typed. `--reset` runs `rm -rf <repo>/demo` and `init-pki` first. If `tmux` isn't installed, the script prints the Option A commands and exits instead.
+
+- Only the public Root certificate moves between homes; this models out-of-band distribution.
+- `demo/server` contains no Sub-CA key. `demo/alice` contains only Alice's keys.
+- Ports are overridable with `--port`. Passphrases can be supplied with `PING_<NAME>_PASSPHRASE_FILE` (mode 0600) for rehearsals. Keep those files in `<repo>/demo/` (gitignored), not elsewhere on the machine.
+
+### Demo script (what to show)
+1. Alice and Bob register. T1 traces CSR and proof-of-possession checks and issuance.
+2. Both run `verify`. The safety numbers match on screen, and the contact is marked verified.
+3. Alice sends "hola bob":
+   - T3 traces Encaps, encryption and signing.
+   - T2 logs `stored envelope 4.6 kB for bob` (no plaintext).
+   - T4 shows the message within about 1 s, with each check marked ✔.
+4. Tamper: flip one byte in `demo/server/data/server/messages/bob/<id>.json`, then refetch. T4 shows `✘ signature invalid → REJECTED`, and T2's audit log shows the event. Or run `scripts/tamper_demo.py`.
+5. MITM: restart the server with `--evil` (test-only flag; it swaps in a rogue-CA certificate for Bob). Alice's send is refused with `✘ chain: untrusted issuer`.
+6. (Stage 2) `ping status` shows rejection counters; `ping ca revoke bob` makes Bob's next mTLS handshake fail.
 
 ## Stage 1: core app (this pass)
 0. Copy this plan to `plan.md` at the repo root (left uncommitted) so it can be referred to during implementation and turned into the report.
-1. Config, log, storage, auth, keystore, pki, plus `init-pki` and the unit tests for these.
+1. Config (`--home`), logging (trace, JSON logs, audit, redaction), storage, auth, keystore, pki, plus `init-pki` (`--server-home`), with the unit tests for these.
 2. CA service, messaging service, LocalBackend, CLI register/login. **Checkpoint: local mode works end to end.**
-3. Messaging, contacts (TOFU pins and safety numbers), send/inbox in local mode, with envelope, tamper and MITM tests.
-4. Protocol, `tlsserver`, both TLS services, RemoteBackend, with integration and TLS tests.
+3. Messaging, contacts (TOFU pins and safety numbers), send/inbox, local-mode live delivery (polling), with envelope, tamper and MITM tests.
+4. Protocol, `tlsserver`, both TLS services, RemoteBackend, `wait_inbox` long-poll and the client listener thread, with integration and TLS tests.
+5. `scripts/demo.sh`, `--evil` test flag, plus a full four-terminal rehearsal.
 
 ## Stage 2: extras (after the stage-1 checkpoint)
 1. **Password change.** Runs over an authenticated session.
@@ -392,6 +461,8 @@ data/                              # app state, no private keys
    - A re-issued contact shows as a pin change, so the user verifies the safety number again.
    - Probe first that ML-DSA CRLs work in both `cryptography` and the `ssl` module's OpenSSL.
 3. **Tamper and MITM demo**, `scripts/tamper_demo.py`. Uses a temporary `PING_HOME` and passphrase files, registers alice and bob, and sends a real message. It then runs every attack in the test catalogue below and prints `ATTACK → REJECTED: <reason>` for the report screenshots. It shares its scenario helpers with the tests.
+4. **`ping status`** with in-memory counters, and certificate fingerprints and expiry dates.
+5. **Tamper-evident audit log** (optional): hash-chained entries plus signed heads, and `status --verify-audit`.
 
 ## Testing strategy
 - **Tools:** `pytest` (dev dependency). Run with `uv run pytest`.
@@ -440,13 +511,28 @@ data/                              # app state, no private keys
     - signed by a valid certificate that isn't the sender's
   - `canon` is stable regardless of key order.
 - `test_storage.py`: path-traversal usernames rejected; atomic writes.
+- `test_log.py`:
+  - `RedactingFilter` masks every listed field name, including inside nested dicts.
+  - A token is logged only as an 8-character hash prefix.
+  - JSON lines parse correctly, and `req_id`/`msg_id` propagate through context variables.
+  - Trace lines are written only with `--trace`.
+- `test_config.py`:
+  - `--home demo/x` resolves to `<repo>/demo/x`.
+  - Refused: `/tmp/x`, `~/x`, `../x`, and a symlink inside the repo pointing outside it, for both `--home` and `PING_HOME`.
+  - `allow_external=True` works from the API only.
+  - `init-pki --server-home` puts no Sub-CA or Root key in the server home.
 
 ### Integration tests (both modes)
 - `test_accounts.py`:
   - Register via CA then the server; login and logout; session expiry.
   - Rejected: duplicate username at the CA; registering on the server with a certificate whose CN doesn't match.
   - A wrong password gives a generic error.
-- `test_e2e.py`: alice sends to bob and bob reads it; mallory can't read bob's inbox; the safety numbers match across clients.
+- `test_e2e.py`:
+  - alice sends to bob and bob reads it; mallory can't read bob's inbox; the safety numbers match across clients
+  - Live delivery: bob's `wait_inbox` returns within 1 s of alice's send, and returns `[]` on timeout. Polling in local mode picks the message up.
+  - A rejected envelope is shown as REJECTED, not dropped silently.
+  - **No secrets in logs:** after a full register, login and send in both modes, grep every `logs/*.log` for the password, the `K_auth` hex, the token, the plaintext and the CEK. Zero hits expected.
+  - Audit events exist for login fail, mTLS reject and message reject.
 - `test_mitm.py` (`malicious_server` and `rogue_ca`):
   - A substituted bob KEM certificate from a rogue CA → the send is refused (chain).
   - A substituted certificate that is validly issued but different (simulated compromised CA) → `KeyChanged` (pin).
@@ -475,9 +561,14 @@ data/                              # app state, no private keys
   - a re-issued user shows as a pin change
   - other users are unaffected
 - `tamper_demo.py` runs without prompts and exits 0 only if every attack is rejected.
+- `status`: counters increase on rejections; fingerprints match the certificates on disk. Audit chain: editing one entry → `--verify-audit` fails.
 
 ## Verification (manual, for the report)
 - `uv run ping init-pki` → `openssl x509 -text -noout -in ...` shows ML-DSA OIDs, BasicConstraints, KeyUsage and EKU for every certificate.
-- Four terminals: `uv run ping ca`, `uv run ping server`, then two `uv run ping client` → register, compare safety numbers, send, read.
+- Full demo rehearsal, done both ways: Option A (four ordinary terminals) and Option B (`scripts/demo.sh --reset`). Check that:
+  - Bob sees Alice's message live.
+  - The tamper and `--evil` steps are rejected.
+  - `demo/*/logs/*.log` contain audit events but no secrets.
+  - Nothing is created outside `<repo>`: `git status --ignored` shows only `demo/`, and `~` is untouched.
 - `openssl s_client -connect 127.0.0.1:PORT -CAfile keys/pki/root/root_ca.crt.pem -groups X25519MLKEM768` handshake succeeds on both services. This confirms the hybrid post-quantum key exchange.
 - `uv run pytest` green; `uv run python scripts/tamper_demo.py` output used for the report.
