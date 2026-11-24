@@ -1,4 +1,4 @@
-# Ping: PQC secure messenger (UC3M crypto project)
+# Ping: PQC secure messenger, full plan
 
 ## Context
 
