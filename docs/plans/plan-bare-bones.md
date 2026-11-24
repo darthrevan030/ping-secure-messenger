@@ -1,4 +1,4 @@
-# Ping: secure messenger, bare-bones plan (PQC-only)
+# Ping: secure messenger, bare-bones plan (UC3M crypto project, PQC-only)
 
 ## 1. Scope
 
@@ -47,14 +47,23 @@ Decisions:
 - **Defended:**
   - They can't read anyone else's messages or private keys.
   - They can't forge a message, substitute someone's public key, or change a message undetected. The reader rejects it and says why.
+  - Both participants always see the same message: a sender can't put different text in the two encrypted copies.
 - **Not defended (stated in the report):**
-  - Deletion of messages (availability).
+  - Deleting messages can't be prevented (a shared directory has no replication). It is detected where possible; see the availability row of the CIA table below.
   - Metadata: folder names and file times show who talks to whom, and when.
   - A stolen Sub-CA key and passphrase can certify fake keys. There is no revocation.
   - Offline password guessing against a stolen key file (Scrypt only slows it down).
   - No forward secrecy: a stolen KEM key plus password decrypts that user's past messages.
   - No proof that a user holds their KEM private key. The binding signature ties the KEM key to the signing-key owner, so a user registering someone else's KEM key gains nothing readable. Challenge-response proof is an extension.
   - Python can't reliably wipe secrets from memory.
+
+### CIA triad mapping
+
+| Pillar | Mechanisms | Stated limit |
+| --- | --- | --- |
+| Confidentiality | ML-KEM-768 + AES-256-GCM per reader; private keys sealed under a Scrypt-derived key; sealed per-user trust pin | Metadata is visible; no forward secrecy |
+| Integrity | ML-DSA signature on every envelope, verified before decryption; AES-GCM tags with the header as AAD; certificate chain verified on every use; signed plaintext commitment, so both readers verify they received the same message; sealed key files with metadata as AAD | A stolen Sub-CA key can certify fake keys |
+| Availability | **Detection:** a signed per-sender sequence number exposes missing, duplicated or conflicting messages. **Resilience:** every file is checked independently and fails closed, so one malformed or hostile file can't hide or crash the rest; size limits are checked before parsing; atomic writes and exclusive creates leave no partial or overwritten messages; the CA is offline, so there is no live service to take down | Deletion can't be prevented without replication or backups. Deleting the newest message isn't detectable until the sender's next message arrives |
 
 ## 4. Key table
 
@@ -124,7 +133,8 @@ mail/<a>__<b>/<msg_id>.json     # a < b alphabetically
 ```
 
 - Usernames match `^[a-z0-9_]{3,32}$` (blocks path traversal). Passwords are at least 12 characters.
-- Key files are mode 0600. Requests and messages are created exclusively (`O_EXCL`).
+- Key files are mode 0600. Requests and messages are created exclusively (`O_EXCL`). Every write goes to a temporary file and is moved into place with `os.replace`, so a crash never leaves a partial file.
+- Files are size-limited (envelopes 1 MB, message text 4 KB), checked before parsing.
 
 ## 8. Flows
 
@@ -147,7 +157,7 @@ mail/<a>__<b>/<msg_id>.json     # a < b alphabetically
    - the KEM public key `ek`
    - `bind = Sign(canon{user, H(ek)}, context="ping/v1/kem-bind")`
 
-The user is now pending.
+The user stays pending (can't log in fully or receive messages) until the CA approves.
 
 **`ca approve <u>`** (`ca list` shows pending requests).
 
@@ -164,15 +174,15 @@ The user is now pending.
 **Send A→B** (KEM-DEM, one encrypted copy per reader):
 
 1. Load B's certificates and run `verify_chain` (`kem` purpose, user B, pinned Root). Refuse sending to yourself.
-2. `header = {v, msg_id, sender, recipient, ts, sender_sign_fp, sender_kem_fp, recipient_kem_fp}`.
+2. `seq` = the sender's next counter in this conversation (0, 1, 2, …), taken from the sender's own verified earlier messages. Pick `pt_salt` = 32 random bytes and `pt_commit = SHA256("ping/v1/pt" ‖ pt_salt ‖ plaintext)`. Then `header = {v, msg_id, seq, sender, recipient, ts, sender_sign_fp, sender_kem_fp, recipient_kem_fp, pt_commit}`.
 3. For each reader R in {B, A}:
    - `ss_R, ct_R = ek_R.encapsulate()`
    - `key_R = HKDF(ss_R, info = "ping/v1/dem" ‖ ct_R ‖ SHA256(ek_R) ‖ SHA256(canon(header)))`
-   - `ctext_R = AESGCM(key_R).encrypt(nonce_R, plaintext, aad = canon({header, r: R}))`
+   - `ctext_R = AESGCM(key_R).encrypt(nonce_R, pt_salt ‖ plaintext, aad = canon({header, r: R}))`
 4. `sig = Sign(canon{header, to}, context="ping/v1/envelope")`. Encrypt-then-sign.
 5. Write `mail/a__b/<msg_id>.json`.
 
-There is no CEK wrapping layer: the KEM secret keys AES-GCM directly. Wrapping a random CEK is the alternative for many recipients.
+There is no CEK wrapping layer: the KEM secret keys AES-GCM directly. Wrapping a random CEK is the alternative for many recipients. Because each reader gets a separate ciphertext, the signed `pt_commit` is what forces both copies to hold the same message: each reader recomputes it after decrypting (Read, step 6).
 
 **Read `open <peer>`.** For each file, fail-closed, in this order:
 
@@ -181,8 +191,11 @@ There is no CEK wrapping layer: the KEM secret keys AES-GCM directly. Wrapping a
 3. Verify the signature, **before any decryption**.
 4. Addressing: {sender, recipient} == {me, peer}, and my KEM fingerprint is in the header.
 5. `decapsulate` my copy, HKDF, AES-GCM decrypt.
+6. Split the result into `pt_salt` and `plaintext`, and check `SHA256("ping/v1/pt" ‖ pt_salt ‖ plaintext) == header.pt_commit`. A mismatch is rejected as "copies differ".
 
 Messages are sorted by `ts`, then `msg_id`. A duplicate `msg_id` is shown once. A message that fails any step shows as `⚠ REJECTED (<file>): <reason>`, never as plaintext.
+
+After all files are processed, check each sender's `seq` values. A gap shows `⚠ MISSING: n message(s) from <sender> before seq k`. Two different messages with the same `seq` show `⚠ CONFLICT`. Each file is processed independently, so one bad file never blocks the others.
 
 ## 9. Modules and CLI
 
@@ -226,7 +239,7 @@ The script prints these demos; the report gets a section from them.
 **Report outline:**
 
 1. App and goals
-2. Threat model
+2. Threat model and CIA mapping
 3. Architecture diagram
 4. Algorithm table with justifications
 5. Key table and serialization
@@ -275,6 +288,9 @@ Each partner writes the tests for the other's modules. Both are responsible for 
   - signed by mallory's valid certificate under alice's name
   - KEM certificate from a rogue CA swapped in
   - duplicate `msg_id` shown once
+  - different plaintext in the two copies (commitment mismatch → rejected)
+  - a message deleted from the middle → gap reported; two messages with one `seq` → conflict reported
+  - garbage and oversized files don't block the readable messages
 - **`test_pqc`:** tampered KEM ciphertext → different secret, no exception; context separation.
 - **`test_e2e`:** sign-up → approve → login → send → read. Logs contain no password or key material.
 
@@ -292,7 +308,7 @@ Each partner writes the tests for the other's modules. Both are responsible for 
 2. Alice ↔ Bob conversation with `--trace`.
 3. `tamper_demo.py`: flip a byte in an envelope, swap Bob's KEM certificate for a rogue one, copy an envelope into another conversation, forge a sender. Each prints `ATTACK → REJECTED: <reason>`.
 
-**If time runs short, cut in this order:** duplicate handling → trace polish → `fingerprints` command → parameter-set comparison in `pqc_lab`. **Never cut:** chain verification on every use, the tamper demo, the key table.
+**If time runs short, cut in this order:** duplicate handling → trace polish → `fingerprints` command → parameter-set comparison in `pqc_lab`. **Never cut:** chain verification on every use, the tamper demo, the key table, the plaintext commitment and the `seq` check (they back the CIA claim).
 
 ## 15. Extensions (only after step 4)
 
