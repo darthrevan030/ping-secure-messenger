@@ -1,4 +1,4 @@
-# Ping: secure messenger, basic plan (UC3M crypto project)
+# Ping: secure messenger, basic plan
 
 ## Context
 
