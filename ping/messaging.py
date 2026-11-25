@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import mldsa, mlkem
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from ping import util
+from ping import keystore, util
 from ping.keystore import Session
 
 try:  # Person B's module; absent until it lands (tests inject a stand-in)
@@ -103,10 +103,16 @@ def send(session: Session, peer: str, text: str) -> str:
         i.seq for i in open_conversation(session, peer)
         if isinstance(i, Message) and i.sender == me
     ]
+    # The sealed counter is what stops a number being reused after a deletion or an expired
+    # certificate hides earlier messages; the verified messages are a floor if it was lost.
+    seq = max(keystore.read_seq(session.home, me, peer, session.k_file),
+              max(prior) + 1 if prior else 0)
+    # Reserve before writing: a send that fails afterwards leaves a visible gap, never a reuse.
+    keystore.write_seq(session.home, me, peer, seq + 1, session.k_file)
     pt_salt = os.urandom(SALT_LEN)
     msg_id = os.urandom(16).hex()
     header = {
-        "v": 1, "msg_id": msg_id, "seq": max(prior) + 1 if prior else 0,
+        "v": 1, "msg_id": msg_id, "seq": seq,
         "sender": me, "recipient": peer, "ts": int(_now().timestamp()),
         "sender_sign_fp": util.fingerprint(session.keys.sign_pub_der),
         "sender_kem_fp": util.fingerprint(session.keys.kem_pub_der),
@@ -258,7 +264,7 @@ def open_conversation(session: Session, peer: str) -> list[Item]:
         if m.msg_id not in seen:
             seen.add(m.msg_id)
             unique.append(m)
-    unique.sort(key=lambda m: (m.ts, m.msg_id))
+    unique.sort(key=lambda m: (m.ts, m.seq, m.msg_id))
     return unique + rejected + _seq_warnings(unique)
 
 
