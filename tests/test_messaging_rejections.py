@@ -70,13 +70,13 @@ class TestRejections:
 
     def test_signed_by_mallory_under_alices_name(self, env, alice, bob):
         mallory = env.add_user("mallory")
-        forge(mallory, bob, {"bobby": "pay mallory", "mallory": "pay mallory"},
+        forge(mallory, bob, {"bobby": "pay mallory", "alice": "pay mallory"},
               header={"sender": "alice"}, dest=("alice", "bobby"))
         assert_only_rejected(messaging.open_conversation(bob, "alice"), "sender key mismatch")
 
     def test_mallory_claiming_alices_fingerprint_fails_signature(self, env, alice, bob):
         mallory = env.add_user("mallory")
-        forge(mallory, bob, {"bobby": "x", "mallory": "x"},
+        forge(mallory, bob, {"bobby": "x", "alice": "x"},
               header={"sender": "alice",
                       "sender_sign_fp": util.fingerprint(alice.keys.sign_pub_der)},
               dest=("alice", "bobby"))

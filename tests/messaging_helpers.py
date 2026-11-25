@@ -54,7 +54,7 @@ def forge(sender, peer, texts, *, signer=None, ctx=b"ping/v1/envelope", header=N
     }
     h.update(header or {})
     to = {}
-    for reader, owner in ((peer.user, peer), (sender.user, sender)):
+    for reader, owner in ((h["recipient"], peer), (h["sender"], sender)):
         ek = eks.get(reader) or owner.keys.kem_priv.public_key()
         shared, kem_ct = ek.encapsulate()
         key = messaging._dem_key(shared, kem_ct, spki(ek), h)

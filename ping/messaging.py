@@ -2,13 +2,16 @@
 
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization as ser
-from cryptography.hazmat.primitives.asymmetric import mlkem
+from cryptography.hazmat.primitives.asymmetric import mldsa, mlkem
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -130,19 +133,105 @@ def send(session: Session, peer: str, text: str) -> str:
     return msg_id
 
 
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+_HEADER_STR = ("sender", "recipient", "sender_sign_fp", "sender_kem_fp", "recipient_kem_fp", "pt_commit")
+
+
+def _is_int(x) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _check_schema(env) -> None:
+    """Required fields and types only; raises Reject('malformed: ...')."""
+    def bad(what):
+        raise Reject(f"malformed: {what}")
+
+    if not isinstance(env, dict) or not isinstance(env.get("header"), dict):
+        bad("header")
+    h, to = env["header"], env.get("to")
+    if not isinstance(env.get("sig"), str):
+        bad("sig")
+    if h.get("v") != 1 or not _is_int(h.get("v")):
+        bad("version")
+    if not isinstance(h.get("msg_id"), str) or not _HEX32.match(h["msg_id"]):
+        bad("msg_id")
+    if not _is_int(h.get("seq")) or h["seq"] < 0 or not _is_int(h.get("ts")):
+        bad("seq/ts")
+    for k in _HEADER_STR:
+        if not isinstance(h.get(k), str):
+            bad(k)
+    for k in ("sender", "recipient"):
+        try:
+            util.valid_username(h[k])
+        except ValueError:
+            bad(k)
+    if h["sender"] == h["recipient"]:
+        bad("sender equals recipient")
+    if not isinstance(to, dict) or set(to) != {h["sender"], h["recipient"]}:
+        bad("to")
+    for copy in to.values():
+        if not isinstance(copy, dict) or not all(
+            isinstance(copy.get(k), str) for k in ("kem_ct", "nonce", "ctext")
+        ):
+            bad("copy")
+
+
 def _open_one(session: Session, peer: str, path: Path) -> Message:
-    envelope = json.loads(util.read_limited(path, MAX_ENVELOPE))
-    header = envelope["header"]
-    copy = envelope["to"][session.user]
-    ek_der = session.keys.kem_pub_der
-    shared = session.keys.kem_priv.decapsulate(util.b64d(copy["kem_ct"]))
-    key = _dem_key(shared, util.b64d(copy["kem_ct"]), ek_der, header)
-    aad = util.canon({"header": header, "r": session.user})
-    opened = AESGCM(key).decrypt(util.b64d(copy["nonce"]), util.b64d(copy["ctext"]), aad)
-    return Message(
-        header["msg_id"], header["seq"], header["sender"], header["ts"],
-        opened[SALT_LEN:].decode("utf-8"), path.name,
-    )
+    """Verify and decrypt one envelope file; raises Reject with the reason shown to the user."""
+    me = session.user
+    try:
+        raw = util.read_limited(path, MAX_ENVELOPE)
+    except util.TooLarge:
+        raise Reject("malformed: file too large") from None
+    try:
+        env = json.loads(raw)
+    except ValueError:
+        raise Reject("malformed: not valid JSON") from None
+    _check_schema(env)  # 1. schema
+    h, to = env["header"], env["to"]
+
+    try:  # 2. sender certificate chain, then its key against the header
+        cert = pki.load_cert(session.home, h["sender"], "sign")
+        pki.verify_chain(cert, "sign", h["sender"], session.pinned_root_fp, _now())
+    except (pki.ChainError, OSError, ValueError) as e:
+        raise Reject(f"sender certificate invalid: {e}") from None
+    sender_pub = cert.public_key()
+    if not isinstance(sender_pub, mldsa.MLDSA65PublicKey):
+        raise Reject("sender certificate invalid: not an ML-DSA-65 key")
+    if util.fingerprint(_spki(sender_pub)) != h["sender_sign_fp"]:
+        raise Reject("sender key mismatch: header fingerprint differs from certificate")
+
+    try:  # 3. signature, before anything is decrypted
+        sender_pub.verify(util.b64d(env["sig"]), util.canon({"header": h, "to": to}), CONTEXT_ENVELOPE)
+    except (InvalidSignature, ValueError):
+        raise Reject("bad signature") from None
+
+    if {h["sender"], h["recipient"]} != {me, peer}:  # 4. addressing
+        raise Reject("wrong conversation: not between you and this peer")
+    my_fp = util.fingerprint(session.keys.kem_pub_der)
+    if my_fp != (h["sender_kem_fp"] if h["sender"] == me else h["recipient_kem_fp"]):
+        raise Reject("not encrypted for you: KEM key fingerprint differs")
+
+    try:  # 5. decapsulate, derive, decrypt
+        kem_ct = util.b64d(to[me]["kem_ct"])
+        shared = session.keys.kem_priv.decapsulate(kem_ct)
+        key = _dem_key(shared, kem_ct, session.keys.kem_pub_der, h)
+        opened = AESGCM(key).decrypt(
+            util.b64d(to[me]["nonce"]), util.b64d(to[me]["ctext"]),
+            util.canon({"header": h, "r": me}),
+        )
+    except (InvalidTag, ValueError):
+        raise Reject("decryption failed") from None
+    util.trace(f"ML-KEM-768 decapsulate + AES-256-GCM decrypt OK: {len(opened)} B")
+
+    pt_salt, plaintext = opened[:SALT_LEN], opened[SALT_LEN:]  # 6. commitment
+    if len(opened) < SALT_LEN or not hmac.compare_digest(_commit(pt_salt, plaintext), h["pt_commit"]):
+        raise Reject("copies differ: plaintext does not match the signed commitment")
+    try:
+        text = plaintext.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Reject("malformed: text is not UTF-8") from None
+    return Message(h["msg_id"], h["seq"], h["sender"], h["ts"], text, path.name)
 
 
 def conv_files(session: Session, peer: str) -> list[Path]:
@@ -156,5 +245,12 @@ def open_conversation(session: Session, peer: str) -> list[Item]:
     util.valid_username(peer)
     if peer == session.user:
         raise ValueError("no conversation with yourself")
-    messages = [_open_one(session, peer, p) for p in conv_files(session, peer)]
-    return sorted(messages, key=lambda m: (m.ts, m.msg_id))
+    messages, rejected = [], []
+    for path in conv_files(session, peer):
+        try:
+            messages.append(_open_one(session, peer, path))
+        except Reject as e:
+            rejected.append(Rejected(path.name, str(e)))
+        except Exception as e:  # fail closed: a hostile file must never crash the reader
+            rejected.append(Rejected(path.name, f"malformed: unexpected {type(e).__name__}"))
+    return sorted(messages, key=lambda m: (m.ts, m.msg_id)) + rejected
