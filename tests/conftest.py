@@ -11,3 +11,13 @@ def fast_scrypt(monkeypatch):
 @pytest.fixture
 def tmp_home(tmp_path):
     return tmp_path / "home"
+
+
+@pytest.fixture
+def env(tmp_home, monkeypatch):
+    from ping import messaging
+    from tests.pki_fixture import Env
+
+    e = Env(tmp_home)
+    monkeypatch.setattr(messaging, "pki", e.pki, raising=False)
+    return e
