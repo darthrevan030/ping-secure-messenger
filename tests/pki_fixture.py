@@ -15,6 +15,8 @@ from cryptography.x509.oid import NameOID
 
 from ping import keystore, util
 
+K_FILE = b"f" * 32
+
 
 class ChainError(Exception):
     pass
@@ -78,6 +80,7 @@ class Env:
     def __init__(self, home):
         self.home = home
         self.ca, self.rogue = make_ca("ping"), make_ca("rogue")
+        self.sessions = {}
         for name, cert in (("root", self.ca.root_cert), ("sub", self.ca.sub_cert)):
             util.atomic_write(home / "pki" / f"{name}.crt.pem", cert.public_bytes(ser.Encoding.PEM), 0o644)
         self.pki = SimpleNamespace(ChainError=ChainError, load_cert=self._load_cert,
@@ -89,7 +92,19 @@ class Env:
         keys = keystore.generate_user_keys()
         write_cert(self.home, name, "sign", issue(ca, name, keys.sign_priv.public_key(), "sign", expired=expired))
         write_cert(self.home, name, "kem", issue(ca, name, keys.kem_priv.public_key(), "kem", expired=expired))
-        return keystore.Session(self.home, name, keys, self.ca.root_fp)
+        self.sessions[name] = keystore.Session(self.home, name, keys, self.ca.root_fp, K_FILE)
+        return self.sessions[name]
+
+    def reissue(self, name, *, expired=False, new_sign_key=False):
+        """The CA's renewal: fresh certificates for the user's existing keys.
+
+        expired=True re-issues already-expired certificates; new_sign_key=True certifies a
+        different signing key instead (a rotation, which must not vouch for old messages).
+        """
+        keys = self.sessions[name].keys
+        sign_priv = mldsa.MLDSA65PrivateKey.generate() if new_sign_key else keys.sign_priv
+        write_cert(self.home, name, "sign", issue(self.ca, name, sign_priv.public_key(), "sign", expired=expired))
+        write_cert(self.home, name, "kem", issue(self.ca, name, keys.kem_priv.public_key(), "kem", expired=expired))
 
     @staticmethod
     def _load_cert(home, user, purpose):
