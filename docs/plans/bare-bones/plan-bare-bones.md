@@ -63,7 +63,7 @@ Decisions:
 | --- | --- | --- |
 | Confidentiality | ML-KEM-768 + AES-256-GCM per reader; private keys sealed under a Scrypt-derived key; sealed per-user trust pin | Metadata is visible; no forward secrecy |
 | Integrity | ML-DSA signature on every envelope, verified before decryption; AES-GCM tags with the header as AAD; certificate chain verified on every use; signed plaintext commitment, so both readers verify they received the same message; sealed key files with metadata as AAD | A stolen Sub-CA key can certify fake keys |
-| Availability | **Detection:** a signed per-sender sequence number exposes missing, duplicated or conflicting messages. **Resilience:** every file is checked independently and fails closed, so one malformed or hostile file can't hide or crash the rest; size limits are checked before parsing; atomic writes and exclusive creates leave no partial or overwritten messages; the CA is offline, so there is no live service to take down | Deletion can't be prevented without replication or backups. Deleting the newest message isn't detectable until the sender's next message arrives |
+| Availability | **Detection:** a signed per-sender sequence number exposes missing, duplicated or conflicting messages. **Resilience:** every file is checked independently and fails closed, so one malformed or hostile file can't hide or crash the rest; size limits are checked before parsing; atomic writes and exclusive creates leave no partial or overwritten messages; the CA is offline, so there is no live service to take down | Deletion can't be prevented without replication or backups. Deleting the newest message isn't detectable until the sender's next message arrives; then the sealed counter makes the gap show. Deleting the counter file together with the newest message, or restoring an older counter file, hides it |
 
 ## 4. Key table
 
@@ -92,7 +92,7 @@ Decisions:
 
 ```json
 {"v":1,"alg":"AES-256-GCM","kdf":{...}|"user-login","owner":"alice",
- "role":"root|sub|user-sign|user-kem|user-trust","pub_fp":"…","nonce":"…","ct":"…"}
+ "role":"root|sub|user-sign|user-kem|user-trust|user-seq","pub_fp":"…","nonce":"…","ct":"…"}
 ```
 
 - `ct = AESGCM(kek).encrypt(nonce, pkcs8_der, aad=canon(all other fields))`.
@@ -127,6 +127,7 @@ Decisions:
 ```text
 pki/        root.key.json  sub.key.json  root.crt.pem  sub.crt.pem
 users/<u>/  account.json   sign.key.json kem.key.json  trust.json
+users/<u>/seq/<peer>.json       # sealed next-seq counter, one per conversation
 requests/<u>.json
 certs/<u>/  sign.crt.pem   kem.crt.pem
 mail/<a>__<b>/<msg_id>.json     # a < b alphabetically
@@ -164,17 +165,25 @@ The user stays pending (can't log in fully or receive messages) until the CA app
 1. Verify the CSR signature, CN == requested name, and `bind` under the CSR key. Check the name hasn't been issued already.
 2. Issue the sign and KEM certificates, write `certs/<u>/`, delete the request.
 
+**`ca renew <u>`** (certificates last 1 year).
+
+1. Re-issue both certificates for the user's **existing** public keys, with a fresh validity period. Refuse if the user has no certificates yet.
+2. Old messages verify again, because the sender's key fingerprint in each header is unchanged. A renewal that certifies a *different* signing key does not vouch for old messages (they show "sender key mismatch").
+3. Why not verify old messages "as of their timestamp" instead: `ts` is chosen by the sender, so a stolen expired key could backdate messages.
+4. While a certificate is expired and not yet renewed, that sender's messages are rejected with "sender certificate invalid".
+
 **Login.**
 
 1. Recompute `pw_key` and check the verifier. Any failure gives a generic "wrong username or password".
 2. Open `trust.json`, then the key files. `InvalidTag` here means a tampered file: abort and say so.
 3. Certificates missing → "pending approval".
-4. Verify your own chain. The certified public keys must equal your own.
+4. Verify your own chain. The certified public keys must equal your own. An expired certificate gives "certificate expired: ask the CA to renew".
+5. Build the session with `K_file` in memory; it seals the per-conversation counters.
 
 **Send A→B** (KEM-DEM, one encrypted copy per reader):
 
 1. Load B's certificates and run `verify_chain` (`kem` purpose, user B, pinned Root). Refuse sending to yourself.
-2. `seq` = the sender's next counter in this conversation (0, 1, 2, …), taken from the sender's own verified earlier messages. Pick `pt_salt` = 32 random bytes and `pt_commit = SHA256("ping/v1/pt" ‖ pt_salt ‖ plaintext)`. Then `header = {v, msg_id, seq, sender, recipient, ts, sender_sign_fp, sender_kem_fp, recipient_kem_fp, pt_commit}`.
+2. `seq` = the sender's next counter in this conversation (0, 1, 2, …): the higher of the sealed counter `users/<me>/seq/<peer>.json` and one more than the highest `seq` among the sender's own verified messages. The counter is written **before** the envelope, so a failed send leaves a visible gap and a number is never reused, even after a deletion or an expired certificate. A tampered counter file makes the send fail. Pick `pt_salt` = 32 random bytes and `pt_commit = SHA256("ping/v1/pt" ‖ pt_salt ‖ plaintext)`. Then `header = {v, msg_id, seq, sender, recipient, ts, sender_sign_fp, sender_kem_fp, recipient_kem_fp, pt_commit}`.
 3. For each reader R in {B, A}:
    - `ss_R, ct_R = ek_R.encapsulate()`
    - `key_R = HKDF(ss_R, info = "ping/v1/dem" ‖ ct_R ‖ SHA256(ek_R) ‖ SHA256(canon(header)))`
@@ -193,7 +202,7 @@ There is no CEK wrapping layer: the KEM secret keys AES-GCM directly. Wrapping a
 5. `decapsulate` my copy, HKDF, AES-GCM decrypt.
 6. Split the result into `pt_salt` and `plaintext`, and check `SHA256("ping/v1/pt" ‖ pt_salt ‖ plaintext) == header.pt_commit`. A mismatch is rejected as "copies differ".
 
-Messages are sorted by `ts`, then `msg_id`. A duplicate `msg_id` is shown once. A message that fails any step shows as `⚠ REJECTED (<file>): <reason>`, never as plaintext.
+Messages are sorted by `ts`, then `seq`, then `msg_id` (so quick messages from one sender stay in order). A duplicate `msg_id` is shown once. A message that fails any step shows as `⚠ REJECTED (<file>): <reason>`, never as plaintext.
 
 After all files are processed, check each sender's `seq` values. A gap shows `⚠ MISSING: n message(s) from <sender> before seq k`. Two different messages with the same `seq` show `⚠ CONFLICT`. Each file is processed independently, so one bad file never blocks the others.
 
@@ -202,7 +211,7 @@ After all files are processed, check each sender's `seq` values. A gap shows `�
 Modules: `util` · `auth` · `keystore` · `pki` · `ca` · `messaging` · `cli`. Scripts: `tamper_demo.py`, `pqc_lab.py`.
 
 - `ping init-pki`
-- `ping ca list` / `ping ca approve <u>`
+- `ping ca list` / `ping ca approve <u>` / `ping ca renew <u>`
 - `ping signup` / `ping login`. The logged-in menu has `chats`, `open <peer>`, `fingerprints`, `logout`.
 - Flags: `--home`, `--trace`. `--trace` prints one line per crypto step with algorithm and sizes. These lines are the report's terminal snapshots.
 
@@ -253,21 +262,27 @@ The script prints these demos; the report gets a section from them.
 
 | | Person A: crypto core + messaging | Person B: PKI + app |
 | --- | --- | --- |
-| Code | `util`, `auth`, `keystore`, `messaging`, `pqc_lab` | `pki`, `ca`, `cli`, `tamper_demo` |
-| Report | §2, §4, §5, messaging flows, §10 | §3, §6, sign-up / login flows, negative tests |
+| Code | `util`, `auth`, `keystore` (sealed files, per-conversation `seq` counters), `messaging`, `pqc_lab` | `pki`, `ca` (`init-pki`, `approve`, `renew`), `cli`, `tamper_demo` |
+| Report | §2, §4, §5, messaging flows (incl. `seq` counter and availability row), §10 | §3, §6, sign-up / login flows, certificate renewal, negative tests |
 
 **Interfaces to agree on day 1**, so the two halves can be built in parallel:
 
 ```python
 keystore.seal(payload, kek, *, owner, role, pub_fp, kdf) -> dict
 keystore.open(container, kek) -> bytes                      # raises InvalidTag
+keystore.Session(home, user, keys, pinned_root_fp, k_file)  # built by login, passed to messaging
+keystore.read_seq(home, user, peer, k_file) -> int          # sealed per-conversation counter
+keystore.write_seq(home, user, peer, next_seq, k_file)
 auth.derive(password, salt) -> (k_auth, k_file)
-pki.verify_chain(cert, purpose, user, pinned_root_fp, at)   # raises ChainError
-messaging.send(home, me, peer, text)
-messaging.open_conversation(home, me, peer)
+pki.load_cert(home, user, purpose) -> Certificate           # purpose: "sign" | "kem"
+pki.verify_chain(home, cert, purpose, user, pinned_root_fp, at)   # raises ChainError
+messaging.send(session, peer, text) -> msg_id
+messaging.open_conversation(session, peer) -> list[Message | Rejected | Warning]
 ```
 
-Each partner writes the tests for the other's modules. Both are responsible for understanding the whole system.
+- `messaging` needs the sender's keys, so it takes a `Session` (not `home, me`). `verify_chain` takes `home` because it must find the Sub-CA and Root certificates in `pki/`.
+- Each partner writes the tests for the other's modules. In practice the implementer writes tests first, and the partner reviews them and adds the negative cases. Both are responsible for understanding the whole system.
+- **Status (Person A):** `util`, `auth`, `keystore`, `messaging` and `pqc_lab` are built and tested against a test-only stand-in for `pki`. Left for A: switch `messaging` to the `home` form of `verify_chain` and run it against B's real `pki` (see `plan-person-a.md`, Tasks 8–9).
 
 ## 13. Tests (`uv run pytest`, fast Scrypt parameters)
 
@@ -290,6 +305,9 @@ Each partner writes the tests for the other's modules. Both are responsible for 
   - duplicate `msg_id` shown once
   - different plaintext in the two copies (commitment mismatch → rejected)
   - a message deleted from the middle → gap reported; two messages with one `seq` → conflict reported
+  - the newest message deleted, then another sent → the `seq` is not reused and the gap shows; a failed send leaves a gap, not a duplicate
+  - sealed counter: tampered, or copied to another peer → refused
+  - certificate expired → messages rejected; renewed with the same keys → history readable again; renewed with a new signing key → "sender key mismatch"
   - garbage and oversized files don't block the readable messages
 - **`test_pqc`:** tampered KEM ciphertext → different secret, no exception; context separation.
 - **`test_e2e`:** sign-up → approve → login → send → read. Logs contain no password or key material.
