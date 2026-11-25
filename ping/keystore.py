@@ -2,7 +2,7 @@
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization as ser
@@ -73,8 +73,9 @@ class UserKeys:
 class Session:
     home: Path
     user: str
-    keys: UserKeys
+    keys: UserKeys = field(repr=False)
     pinned_root_fp: str
+    k_file: bytes = field(repr=False)  # seals per-user state such as sequence counters
 
 
 def _spki(priv) -> bytes:
@@ -162,3 +163,31 @@ def read_trust(home, user: str, k_file: bytes) -> str:
     if root_fp != container["pub_fp"]:
         raise ValueError("trust.json: pub_fp mismatch")
     return root_fp
+
+
+def _seq_path(home, user: str, peer: str) -> Path:
+    return _user_dir(home, user) / "seq" / f"{util.valid_username(peer)}.json"
+
+
+def read_seq(home, user: str, peer: str, k_file: bytes) -> int:
+    """Next sequence number to use towards `peer`; 0 if no counter exists yet."""
+    path = _seq_path(home, user, peer)
+    if not path.exists():
+        return 0
+    container, payload = _read_container(path, user, "user-seq", k_file)
+    if container["pub_fp"] != util.fingerprint(peer.encode("utf-8")):
+        raise ValueError(f"{path.name}: peer mismatch")
+    n = int(payload.decode("ascii"))
+    if n < 0:
+        raise ValueError(f"{path.name}: negative counter")
+    return n
+
+
+def write_seq(home, user: str, peer: str, next_seq: int, k_file: bytes) -> None:
+    if next_seq < 0:
+        raise ValueError("sequence counter cannot be negative")
+    container = seal(
+        str(next_seq).encode("ascii"), k_file, owner=user, role="user-seq",
+        pub_fp=util.fingerprint(peer.encode("utf-8")), kdf="user-login",
+    )
+    _write_container(_seq_path(home, user, peer), container)
