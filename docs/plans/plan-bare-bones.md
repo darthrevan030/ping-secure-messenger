@@ -262,21 +262,27 @@ The script prints these demos; the report gets a section from them.
 
 | | Person A: crypto core + messaging | Person B: PKI + app |
 | --- | --- | --- |
-| Code | `util`, `auth`, `keystore`, `messaging`, `pqc_lab` | `pki`, `ca`, `cli`, `tamper_demo` |
-| Report | §2, §4, §5, messaging flows, §10 | §3, §6, sign-up / login flows, negative tests |
+| Code | `util`, `auth`, `keystore` (sealed files, per-conversation `seq` counters), `messaging`, `pqc_lab` | `pki`, `ca` (`init-pki`, `approve`, `renew`), `cli`, `tamper_demo` |
+| Report | §2, §4, §5, messaging flows (incl. `seq` counter and availability row), §10 | §3, §6, sign-up / login flows, certificate renewal, negative tests |
 
 **Interfaces to agree on day 1**, so the two halves can be built in parallel:
 
 ```python
 keystore.seal(payload, kek, *, owner, role, pub_fp, kdf) -> dict
 keystore.open(container, kek) -> bytes                      # raises InvalidTag
+keystore.Session(home, user, keys, pinned_root_fp, k_file)  # built by login, passed to messaging
+keystore.read_seq(home, user, peer, k_file) -> int          # sealed per-conversation counter
+keystore.write_seq(home, user, peer, next_seq, k_file)
 auth.derive(password, salt) -> (k_auth, k_file)
-pki.verify_chain(cert, purpose, user, pinned_root_fp, at)   # raises ChainError
-messaging.send(home, me, peer, text)
-messaging.open_conversation(home, me, peer)
+pki.load_cert(home, user, purpose) -> Certificate           # purpose: "sign" | "kem"
+pki.verify_chain(home, cert, purpose, user, pinned_root_fp, at)   # raises ChainError
+messaging.send(session, peer, text) -> msg_id
+messaging.open_conversation(session, peer) -> list[Message | Rejected | Warning]
 ```
 
-Each partner writes the tests for the other's modules. Both are responsible for understanding the whole system.
+- `messaging` needs the sender's keys, so it takes a `Session` (not `home, me`). `verify_chain` takes `home` because it must find the Sub-CA and Root certificates in `pki/`.
+- Each partner writes the tests for the other's modules. In practice the implementer writes tests first, and the partner reviews them and adds the negative cases. Both are responsible for understanding the whole system.
+- **Status (Person A):** `util`, `auth`, `keystore`, `messaging` and `pqc_lab` are built and tested against a test-only stand-in for `pki`. Left for A: switch `messaging` to the `home` form of `verify_chain` and run it against B's real `pki` (see `plan-person-a.md`, Tasks 8–9).
 
 ## 13. Tests (`uv run pytest`, fast Scrypt parameters)
 
