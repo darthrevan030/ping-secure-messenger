@@ -253,4 +253,30 @@ def open_conversation(session: Session, peer: str) -> list[Item]:
             rejected.append(Rejected(path.name, str(e)))
         except Exception as e:  # fail closed: a hostile file must never crash the reader
             rejected.append(Rejected(path.name, f"malformed: unexpected {type(e).__name__}"))
-    return sorted(messages, key=lambda m: (m.ts, m.msg_id)) + rejected
+    seen, unique = set(), []
+    for m in messages:  # duplicate msg_id: the first file (by name) wins
+        if m.msg_id not in seen:
+            seen.add(m.msg_id)
+            unique.append(m)
+    unique.sort(key=lambda m: (m.ts, m.msg_id))
+    return unique + rejected + _seq_warnings(unique)
+
+
+def _seq_warnings(messages: list[Message]) -> list[Warning]:
+    """Per sender: gaps in the signed sequence numbers, and distinct messages sharing one."""
+    by_sender: dict[str, dict[int, int]] = {}
+    for m in messages:
+        counts = by_sender.setdefault(m.sender, {})
+        counts[m.seq] = counts.get(m.seq, 0) + 1
+    out = []
+    for sender, counts in sorted(by_sender.items()):
+        expected = 0
+        for seq in sorted(counts):
+            if seq > expected:
+                out.append(Warning(
+                    "MISSING", f"⚠ MISSING: {seq - expected} message(s) from {sender} before seq {seq}"))
+            if counts[seq] > 1:
+                out.append(Warning(
+                    "CONFLICT", f"⚠ CONFLICT: {sender} sent different messages with seq {seq}"))
+            expected = seq + 1
+    return out

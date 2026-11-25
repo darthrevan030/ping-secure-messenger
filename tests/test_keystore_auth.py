@@ -49,6 +49,7 @@ class TestAuth:
 
 # ---------------------------------------------------------------- keystore
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -204,9 +205,9 @@ class TestKeystore:
         kdf = keystore.kdf_params(b"s" * 16)
         assert kdf["name"] == "scrypt" and set(kdf) >= {"n", "r", "p", "salt"}
         a = keystore.kek_from_passphrase("p" * 12, kdf)
-        assert len(a) == 32
-        assert a == keystore.kek_from_passphrase("p" * 12, kdf)
+        assert a == hashlib.scrypt(b"p" * 12, salt=b"s" * 16, n=16, r=8, p=1, dklen=32)
         assert a != keystore.kek_from_passphrase("q" * 12, kdf)
+        assert a != keystore.kek_from_passphrase("p" * 12, keystore.kdf_params(b"t" * 16))
 
     def test_ca_key_sealed_with_passphrase_kek_roundtrips(self):
         kdf = keystore.kdf_params(b"s" * 16)

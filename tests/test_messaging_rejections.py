@@ -129,3 +129,22 @@ class TestRejections:
         messaging.send(alice, "bobby", "hi")
         (alice.home / "certs" / "alice" / "sign.crt.pem").unlink()
         assert_only_rejected(messaging.open_conversation(bob, "alice"), "sender certificate")
+
+
+class TestKeyScheduleIsPinned:
+    """Independently computed vectors, so the forge helper can't hide a wrong KDF input."""
+
+    def test_commit_known_answer(self):
+        assert messaging._commit(b"\x01" * 32, b"hello") == "dr9jNddHbCLyZJoRWUo8neO7FN0vVvFG8jNfOjYnWh0"
+
+    def test_dem_key_known_answer(self):
+        key = messaging._dem_key(b"s" * 32, b"c" * 1088, b"e" * 10, {"a": 1})
+        assert key.hex() == "3325a857b982855a19be588f526f364de55bf7a6a367af6608fd69950114513e"
+
+    def test_changed_header_resigned_fails_decryption(self, alice, bob):
+        # The header is bound into both the KDF info and the AEAD AAD, not only the signature.
+        mid = messaging.send(alice, "bobby", "hi")
+        p = envelope_path(alice, "bobby", mid)
+        tamper(p, lambda d: d["header"].update(ts=d["header"]["ts"] + 1))
+        resign(p, alice)
+        assert_only_rejected(messaging.open_conversation(bob, "alice"), "decryption failed")
