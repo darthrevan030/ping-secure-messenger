@@ -5,18 +5,7 @@ from ping.messaging import Message
 from tests.pki_fixture import ChainError
 
 
-@pytest.fixture
-def alice(env):
-    return env.add_user("alice")
-
-
-@pytest.fixture
-def bob(env):
-    return env.add_user("bobby")
-
-
-def msgs(items):
-    return [i for i in items if isinstance(i, Message)]
+from tests.messaging_helpers import msgs
 
 
 class TestSendAndRead:

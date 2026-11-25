@@ -21,3 +21,18 @@ def env(tmp_home, monkeypatch):
     e = Env(tmp_home)
     monkeypatch.setattr(messaging, "pki", e.pki, raising=False)
     return e
+
+
+@pytest.fixture
+def alice(env):
+    return env.add_user("alice")
+
+
+@pytest.fixture
+def bob(env):
+    return env.add_user("bobby")
+
+
+@pytest.fixture
+def carol(env):
+    return env.add_user("carol")
