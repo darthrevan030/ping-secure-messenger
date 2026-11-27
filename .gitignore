@@ -10,6 +10,7 @@ data/
 logs/
 run/
 demo/
+ping_data/
 
 # OS / editor
 .DS_Store
